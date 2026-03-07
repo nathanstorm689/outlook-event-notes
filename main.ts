@@ -1,4 +1,4 @@
-import { App, ButtonComponent, Modal, TextComponent, displayTooltip, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
+import { App, displayTooltip, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
 import MsgReader from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
@@ -61,15 +61,6 @@ export default class OutlookMeetingNotes extends Plugin {
 			fileData.helper_currentDT = moment().format();
 
 			this.ensureBodyField(fileData);
-
-			if (this.isRecurringAppointment(fileData)) {
-				const occurrenceDate = await this.getRecurringOccurrenceDate(fileData);
-				if (occurrenceDate === null) {
-					new Notice('Meeting note creation cancelled.');
-					return;
-				}
-				this.applyRecurringOccurrenceDate(fileData, occurrenceDate);
-			}
 
 			let targetFolderPath = (this.settings.notesFolder ?? '').trim();
 			if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
@@ -143,175 +134,6 @@ export default class OutlookMeetingNotes extends Plugin {
 			.replace(/&#39;/gi, "'")
 			.replace(/\s+/g, ' ')
 			.trim();
-	}
-
-	private isRecurringAppointment(fileData: any): boolean {
-		const keys = Object.keys(fileData ?? {});
-
-		// Check explicit boolean/truthy recurring flags
-		const boolClues = new Set(['isrecurring', 'isrecurringmeeting', 'recurring']);
-		for (const key of keys) {
-			const lower = key.toLowerCase();
-			if (boolClues.has(lower)) {
-				// Use truthy check: Outlook may send 1 or "true" instead of boolean true
-				if ((fileData as Record<string, unknown>)[key]) {
-					return true;
-				}
-			}
-		}
-
-		// Check fields whose name hints at recurrence and whose value is non-empty
-		const hintSubstrings = ['apptrecur', 'appointmentrecur', 'recurrence', 'recurrencerule', 'recurrencepattern', 'recurrenceinfo', 'recurrencestate', 'recurrencetype', 'recurringmaster', 'apptimezonedefrecur'];
-		for (const key of keys) {
-			const lower = key.toLowerCase();
-			for (const hint of hintSubstrings) {
-				if (lower.includes(hint)) {
-					const value = (fileData as Record<string, unknown>)[key];
-					if (typeof value === 'boolean') { return value; }
-					if (value != null && value !== '') { return true; }
-				}
-			}
-		}
-
-		// Check the message class for occurrence/exception markers
-		if (typeof fileData.messageClass === 'string') {
-			const lowerClass = fileData.messageClass.toLowerCase();
-			if (lowerClass.includes('recurring') || lowerClass.includes('exception') || lowerClass.includes('occurrence')) {
-				return true;
-			}
-		}
-
-		return false;
-	}
-
-	// Returns the occurrence date to use. Pre-fills with the event's own start date
-	// so that if Outlook already encoded the correct occurrence date in the .msg,
-	// the user can simply confirm without retyping.
-	private async getRecurringOccurrenceDate(fileData: any): Promise<string | null> {
-		// Try to use the event's own start date as the default (it may already be correct
-		// for .msg files exported from a specific occurrence rather than the series master).
-		let defaultDate = moment().format('YYYY-MM-DD');
-		const eventStart = moment(fileData.apptStartWhole ?? fileData.apptStartWholeLocal);
-		if (eventStart.isValid()) {
-			defaultDate = eventStart.format('YYYY-MM-DD');
-		}
-
-		let currentValue = defaultDate;
-		while (true) {
-			const result = await this.promptForRecurringDate(currentValue);
-			if (result === null) {
-				return null;
-			}
-			const trimmed = result.trim();
-			if (moment(trimmed, 'YYYY-MM-DD', true).isValid()) {
-				return trimmed;
-			}
-			new Notice('Please enter the date in YYYY-MM-DD format.');
-			if (trimmed !== '') { currentValue = trimmed; }
-		}
-	}
-
-	private async promptForRecurringDate(defaultValue: string): Promise<string | null> {
-		return await new Promise((resolve) => {
-			const modal = new RecurringOccurrenceModal(this.app, defaultValue, resolve);
-			modal.open();
-		});
-	}
-
-	private applyRecurringOccurrenceDate(fileData: any, occurrenceDate: string): void {
-		fileData.helper_selectedOccurrenceDate = occurrenceDate;
-		const selectedDate = moment(occurrenceDate, 'YYYY-MM-DD', true);
-		if (!selectedDate.isValid()) { return; }
-
-		const originalStart = moment(fileData.apptStartWhole);
-		const originalEnd = moment(fileData.apptEndWhole);
-		const originalStartLocal = moment(fileData.apptStartWholeLocal);
-		const originalEndLocal = moment(fileData.apptEndWholeLocal);
-
-		const durationMs = originalStart.isValid() && originalEnd.isValid()
-			? originalEnd.diff(originalStart)
-			: (originalStartLocal.isValid() && originalEndLocal.isValid()
-				? originalEndLocal.diff(originalStartLocal)
-				: null);
-
-		let adjustedStart = originalStart.isValid()
-			? originalStart.clone()
-			: (originalStartLocal.isValid()
-				? originalStartLocal.clone()
-				: selectedDate.clone().startOf('day'));
-		adjustedStart = adjustedStart
-			.year(selectedDate.year())
-			.month(selectedDate.month())
-			.date(selectedDate.date());
-		fileData.apptStartWhole = adjustedStart.format();
-
-		let adjustedEnd: moment.Moment | null = null;
-		if (originalEnd.isValid()) {
-			adjustedEnd = originalEnd.clone()
-				.year(selectedDate.year())
-				.month(selectedDate.month())
-				.date(selectedDate.date());
-		} else if (durationMs !== null) {
-			adjustedEnd = adjustedStart.clone().add(durationMs);
-		}
-		if (adjustedEnd) {
-			fileData.apptEndWhole = adjustedEnd.format();
-		}
-
-		if (originalStartLocal.isValid()) {
-			const adjustedStartLocal = originalStartLocal.clone()
-				.year(selectedDate.year())
-				.month(selectedDate.month())
-				.date(selectedDate.date());
-			fileData.apptStartWholeLocal = adjustedStartLocal.format();
-		} else {
-			fileData.apptStartWholeLocal = adjustedStart.format();
-		}
-
-		if (originalEndLocal.isValid()) {
-			let adjustedEndLocal = originalEndLocal.clone()
-				.year(selectedDate.year())
-				.month(selectedDate.month())
-				.date(selectedDate.date());
-			if (durationMs !== null && originalStartLocal.isValid()) {
-				const startLocalAdjusted = originalStartLocal.clone()
-					.year(selectedDate.year())
-					.month(selectedDate.month())
-					.date(selectedDate.date());
-				adjustedEndLocal = startLocalAdjusted.add(durationMs);
-			} else if (durationMs !== null) {
-				adjustedEndLocal = adjustedStart.clone().add(durationMs);
-			}
-			fileData.apptEndWholeLocal = adjustedEndLocal.format();
-		} else if (durationMs !== null && adjustedEnd) {
-			fileData.apptEndWholeLocal = adjustedEnd.format();
-		}
-
-		if (adjustedStart.isValid()) {
-			fileData.helper_selectedOccurrenceDateTimeIso = adjustedStart.toISOString();
-		}
-
-		const adjustedStartMoment = moment(fileData.apptStartWhole);
-		if (adjustedStartMoment.isValid()) {
-			for (const key of Object.keys(fileData)) {
-				if (!(typeof fileData[key] === 'string')) { continue; }
-				const lowerKey = key.toLowerCase();
-				if (lowerKey.startsWith('apptstart') && lowerKey.includes('date')) {
-					fileData[key] = adjustedStartMoment.format('YYYY-MM-DD');
-				} else if (lowerKey.startsWith('apptstart') && lowerKey.includes('time')) {
-					fileData[key] = adjustedStartMoment.format('HH:mm');
-				} else if (lowerKey.startsWith('apptstart') && lowerKey.includes('text')) {
-					fileData[key] = adjustedStartMoment.format('L LT');
-				}
-			}
-		}
-
-		if (typeof fileData.apptEndText === 'string' && fileData.apptEndWhole) {
-			const adjustedEndMoment = moment(fileData.apptEndWhole);
-			if (adjustedEndMoment.isValid()) {
-				fileData.apptEndText = adjustedEndMoment.format('L LT');
-			}
-		}
 	}
 
 	// Handle a file being dropped onto the ribbon icon.
@@ -405,15 +227,7 @@ export default class OutlookMeetingNotes extends Plugin {
 				return function (datetime_format: string, render: any) {
 					const parts = datetime_format.split('|');
 					const rawValue = render(parts[0]).trim();
-					let formattedMoment = moment(rawValue);
-					if (!formattedMoment.isValid()) {
-						const ctx = this as Record<string, unknown> & { helper_selectedOccurrenceDateTimeIso?: string; helper_selectedOccurrenceDate?: string; };
-						const isoFallback = typeof ctx.helper_selectedOccurrenceDateTimeIso === 'string' ? ctx.helper_selectedOccurrenceDateTimeIso : undefined;
-						if (isoFallback) { formattedMoment = moment(isoFallback); }
-						if (!formattedMoment.isValid() && typeof ctx.helper_selectedOccurrenceDate === 'string') {
-							formattedMoment = moment(ctx.helper_selectedOccurrenceDate, 'YYYY-MM-DD', true);
-						}
-					}
+					const formattedMoment = moment(rawValue);
 					if (!formattedMoment.isValid()) { return rawValue; }
 					return formattedMoment.format(parts[1]);
 				}
@@ -489,75 +303,6 @@ export default class OutlookMeetingNotes extends Plugin {
 		return output;
 	}
 
-}
-
-class RecurringOccurrenceModal extends Modal {
-	private readonly defaultDate: string;
-	private readonly resolvePromise: (value: string | null) => void;
-	private input!: TextComponent;
-	private hasResolved = false;
-
-	constructor(app: App, defaultDate: string, resolve: (value: string | null) => void) {
-		super(app);
-		this.defaultDate = defaultDate;
-		this.resolvePromise = resolve;
-	}
-
-	onOpen(): void {
-		const { contentEl } = this;
-		contentEl.empty();
-		contentEl.createEl('h2', { text: 'Recurring meeting' });
-		contentEl.createEl('p', { text: 'This event is recurring. Confirm or correct the occurrence date (YYYY-MM-DD).' });
-
-		const inputWrapper = contentEl.createDiv({ cls: 'outlook-meeting-notes-recurring-date-input' });
-		this.input = new TextComponent(inputWrapper);
-		this.input.setPlaceholder('YYYY-MM-DD');
-		this.input.setValue(this.defaultDate);
-		this.input.inputEl.setAttribute('aria-label', 'Recurring meeting date');
-		this.input.inputEl.addEventListener('keydown', (evt) => {
-			if (evt.key === 'Enter') {
-				evt.preventDefault();
-				this.submit();
-			}
-		});
-
-		const buttonWrapper = contentEl.createDiv({ cls: 'outlook-meeting-notes-recurring-date-buttons' });
-		new ButtonComponent(buttonWrapper)
-			.setButtonText('Cancel')
-			.onClick(() => this.cancel());
-		new ButtonComponent(buttonWrapper)
-			.setButtonText('OK')
-			.setCta()
-			.onClick(() => this.submit());
-
-		setTimeout(() => {
-			this.input.inputEl.focus({ preventScroll: true });
-			this.input.inputEl.select();
-		}, 0);
-	}
-
-	private submit(): void {
-		if (this.hasResolved) { return; }
-		this.hasResolved = true;
-		const value = this.input.getValue().trim();
-		this.resolvePromise(value);
-		this.close();
-	}
-
-	private cancel(): void {
-		if (this.hasResolved) { return; }
-		this.hasResolved = true;
-		this.resolvePromise(null);
-		this.close();
-	}
-
-	onClose(): void {
-		if (!this.hasResolved) {
-			this.hasResolved = true;
-			this.resolvePromise(null);
-		}
-		this.contentEl.empty();
-	}
 }
 
 class OutlookMeetingNotesSettingTab extends PluginSettingTab {
