@@ -1,9 +1,9 @@
 {
-	"id": "outlook-meeting-notes-plus",
-	"name": "Outlook Meeting Notes Plus",
+	"id": "outlook-event-notes",
+	"name": "Outlook Event Notes",
 	"version": "0.2.1",
 	"minAppVersion": "1.8.9",
-	"description": "Creates meeting notes for Outlook appointments and meetings.",
+	"description": "Creates notes for Outlook appointments and meetings.",
 	"author": "nathanstorm689",
 	"authorUrl": "https://github.com/nathanstorm689",
 	"isDesktopOnly": false

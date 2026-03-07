@@ -47,10 +47,10 @@ export default class OutlookMeetingNotes extends Plugin {
 
 			// Check if we got a suitable meeting
 			if (origFileData.dataType != 'msg') {
-				throw new TypeError('Outlook Meeting Notes cannot process the file. '
+				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'MsgReader did not parse the file as valid msg format.');
 			} else if (origFileData.messageClass != 'IPM.Appointment') {
-				throw new TypeError('Outlook Meeting Notes cannot process the file. '
+				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'It is a valid msg file but not an appointment or meeting.');
 			}
 
@@ -139,13 +139,13 @@ export default class OutlookMeetingNotes extends Plugin {
 	// Handle a file being dropped onto the ribbon icon.
 	async handleDropEvent(dropevt: DragEvent) {
 		if (dropevt.dataTransfer == null) {
-			throw new ReferenceError('Outlook Meeting Notes cannot handle the DragEvent. The event had a null '
+			throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The event had a null '
 				+ 'dataTransfer property, which should never happen when dispatched by the browser, according '
 				+ 'to https://developer.mozilla.org/en-US/docs/Web/API/DragEvent/dataTransfer');
 		} else {
 			const droppedFiles = dropevt.dataTransfer.files
 			if (droppedFiles.length != 1) {
-				new Notice('Outlook Meeting Notes can only handle one meeting being dropped onto the ribbon icon');
+				new Notice('Outlook Event Notes can only handle one meeting being dropped onto the ribbon icon');
 			}
 			else {
 				const droppedFile = droppedFiles[0];
@@ -153,10 +153,10 @@ export default class OutlookMeetingNotes extends Plugin {
 				const fr = new FileReader();
 				fr.onload = () => {
 					if (fr.result == null) {
-						throw new ReferenceError('Outlook Meeting Notes cannot handle the DragEvent. The FileReader had '
+						throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
 							+ 'a null result property, which should not be possible.');
 					} else if (!(fr.result instanceof ArrayBuffer)) {
-						throw new TypeError('Outlook Meeting Notes cannot handle the DragEvent. The FileReader result '
+						throw new TypeError('Outlook Event Notes cannot handle the DragEvent. The FileReader result '
 							+ 'property was not an ArrayBuffer, which should be impossible.');
 					} else {
 						const msgRdr = new MsgReader(fr.result);
@@ -173,7 +173,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		const tooltipMessage = 'Outlook Meeting Notes: Drag and drop a meeting onto this icon from Outlook (or a .msg file) to create a meeting note.';
+		const tooltipMessage = 'Outlook Event Notes: Drag and drop a meeting onto this icon from Outlook (or a .msg file) to create a meeting note.';
 
 		this.ribbonIconEl = this.addRibbonIcon('calendar-clock', tooltipMessage, () => { });
 
@@ -201,7 +201,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			dropevt.preventDefault();
 			this.handleDropEvent(dropevt);
 		});
-		this.ribbonIconEl.addClass('outlook-meeting-notes-icon');
+		this.ribbonIconEl.addClass('outlook-event-notes-icon');
 
 		this.addSettingTab(new OutlookMeetingNotesSettingTab(this.app, this));
 	}

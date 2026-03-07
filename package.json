@@ -1,5 +1,5 @@
 {
-	"name": "outlook-meeting-notes-plus",
+	"name": "outlook-event-notes",
 	"version": "0.2.1",
 	"description": "Creates meeting notes for Outlook appointments and meetings.",
 	"main": "main.js",

@@ -1,6 +1,8 @@
 import esbuild from "esbuild";
 import process from "process";
 import builtins from "builtin-modules";
+import fs from "fs";
+import path from "path";
 
 const banner =
 `/*
@@ -10,6 +12,28 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = (process.argv[2] === "production");
+
+// Path to your Obsidian vault plugin folder for live testing
+const vaultPluginDir = "C:\\Obsidian\\Vault 1\\.obsidian\\plugins\\outlook-event-notes";
+
+function copyToVault() {
+	if (!fs.existsSync(vaultPluginDir)) return;
+	for (const file of ["main.js", "manifest.json", "styles.css"]) {
+		try {
+			fs.copyFileSync(file, path.join(vaultPluginDir, file));
+		} catch (e) {
+			console.error(`Failed to copy ${file} to vault:`, e.message);
+		}
+	}
+	console.log("[vault] Copied main.js, manifest.json, styles.css →", vaultPluginDir);
+}
+
+const copyPlugin = {
+	name: "copy-to-vault",
+	setup(build) {
+		build.onEnd(() => copyToVault());
+	}
+};
 
 const context = await esbuild.context({
 	banner: {
@@ -39,6 +63,7 @@ const context = await esbuild.context({
 	treeShaking: true,
 	outfile: "main.js",
 	minify: prod,
+	plugins: [copyPlugin],
 });
 
 if (prod) {
