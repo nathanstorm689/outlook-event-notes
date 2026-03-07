@@ -1,5 +1,5 @@
 {
-	"name": "outlook-meeting-notes",
+	"name": "outlook-meeting-notes-plus",
 	"version": "0.2.1",
 	"description": "Creates meeting notes for Outlook appointments and meetings.",
 	"main": "main.js",
@@ -9,7 +9,7 @@
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
 	"keywords": [],
-	"author": "",
+	"author": "nathanstorm689",
 	"license": "MIT",
 	"devDependencies": {
 		"@types/moment": "^2.11.29",

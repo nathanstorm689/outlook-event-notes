@@ -1,4 +1,4 @@
-import { App, ButtonComponent, Modal, TextComponent, displayTooltip, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, EventRef, normalizePath } from 'obsidian';
+import { App, ButtonComponent, Modal, TextComponent, displayTooltip, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
 import MsgReader from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
@@ -38,8 +38,6 @@ const DEFAULT_SETTINGS: OutlookMeetingNotesSettings = {
 export default class OutlookMeetingNotes extends Plugin {
 	settings: OutlookMeetingNotesSettings;
 
-	//TODO: Add functionality to export meeting notes nicely
-
 	async createMeetingNote(msg: MsgReader) {
 		try {
 			const { vault } = this.app;
@@ -65,7 +63,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			this.ensureBodyField(fileData);
 
 			if (this.isRecurringAppointment(fileData)) {
-				const occurrenceDate = await this.getRecurringOccurrenceDate();
+				const occurrenceDate = await this.getRecurringOccurrenceDate(fileData);
 				if (occurrenceDate === null) {
 					new Notice('Meeting note creation cancelled.');
 					return;
@@ -110,7 +108,6 @@ export default class OutlookMeetingNotes extends Plugin {
 			const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
 			if (fe) { fe.revealInFolder(meetingNoteFile); }
 		} catch (ee: unknown) {
-			// TODO: Handle errors reasonably -- differently between msg missing elements and errors creating file
 			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
 		}
@@ -123,7 +120,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			fileData.bodyText,
 			fileData.bodyPlainText,
 			fileData.bodyHtml,
-			fileData.rtfCompressed 
+			fileData.rtfCompressed
 		];
 		for (const candidate of fallbacks) {
 			if (typeof candidate === 'string' && candidate.trim() !== '') {
@@ -148,18 +145,22 @@ export default class OutlookMeetingNotes extends Plugin {
 			.trim();
 	}
 
-
 	private isRecurringAppointment(fileData: any): boolean {
 		const keys = Object.keys(fileData ?? {});
+
+		// Check explicit boolean/truthy recurring flags
 		const boolClues = new Set(['isrecurring', 'isrecurringmeeting', 'recurring']);
 		for (const key of keys) {
 			const lower = key.toLowerCase();
 			if (boolClues.has(lower)) {
-				if ((fileData as Record<string, unknown>)[key] === true) {
+				// Use truthy check: Outlook may send 1 or "true" instead of boolean true
+				if ((fileData as Record<string, unknown>)[key]) {
 					return true;
 				}
 			}
 		}
+
+		// Check fields whose name hints at recurrence and whose value is non-empty
 		const hintSubstrings = ['apptrecur', 'appointmentrecur', 'recurrence', 'recurrencerule', 'recurrencepattern', 'recurrenceinfo', 'recurrencestate', 'recurrencetype', 'recurringmaster', 'apptimezonedefrecur'];
 		for (const key of keys) {
 			const lower = key.toLowerCase();
@@ -171,17 +172,31 @@ export default class OutlookMeetingNotes extends Plugin {
 				}
 			}
 		}
+
+		// Check the message class for occurrence/exception markers
 		if (typeof fileData.messageClass === 'string') {
 			const lowerClass = fileData.messageClass.toLowerCase();
 			if (lowerClass.includes('recurring') || lowerClass.includes('exception') || lowerClass.includes('occurrence')) {
 				return true;
 			}
 		}
+
 		return false;
 	}
 
-	private async getRecurringOccurrenceDate(): Promise<string | null> {
-		let currentValue = moment().format('YYYY-MM-DD');
+	// Returns the occurrence date to use. Pre-fills with the event's own start date
+	// so that if Outlook already encoded the correct occurrence date in the .msg,
+	// the user can simply confirm without retyping.
+	private async getRecurringOccurrenceDate(fileData: any): Promise<string | null> {
+		// Try to use the event's own start date as the default (it may already be correct
+		// for .msg files exported from a specific occurrence rather than the series master).
+		let defaultDate = moment().format('YYYY-MM-DD');
+		const eventStart = moment(fileData.apptStartWhole ?? fileData.apptStartWholeLocal);
+		if (eventStart.isValid()) {
+			defaultDate = eventStart.format('YYYY-MM-DD');
+		}
+
+		let currentValue = defaultDate;
 		while (true) {
 			const result = await this.promptForRecurringDate(currentValue);
 			if (result === null) {
@@ -299,7 +314,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		}
 	}
 
-	// Custom funciton to handle a file being dropped onto the ribbon icon.
+	// Handle a file being dropped onto the ribbon icon.
 	async handleDropEvent(dropevt: DragEvent) {
 		if (dropevt.dataTransfer == null) {
 			throw new ReferenceError('Outlook Meeting Notes cannot handle the DragEvent. The event had a null '
@@ -311,7 +326,6 @@ export default class OutlookMeetingNotes extends Plugin {
 				new Notice('Outlook Meeting Notes can only handle one meeting being dropped onto the ribbon icon');
 			}
 			else {
-				// One file was dropped, hand it over to createMeetingNote
 				const droppedFile = droppedFiles[0];
 
 				const fr = new FileReader();
@@ -323,7 +337,6 @@ export default class OutlookMeetingNotes extends Plugin {
 						throw new TypeError('Outlook Meeting Notes cannot handle the DragEvent. The FileReader result '
 							+ 'property was not an ArrayBuffer, which should be impossible.');
 					} else {
-						// As readAsArrayBuffer is being used, below, fr.result will be an ArrayBuffer.
 						const msgRdr = new MsgReader(fr.result);
 						this.createMeetingNote(msgRdr);
 					}
@@ -340,15 +353,10 @@ export default class OutlookMeetingNotes extends Plugin {
 
 		const tooltipMessage = 'Outlook Meeting Notes: Drag and drop a meeting onto this icon from Outlook (or a .msg file) to create a meeting note.';
 
-		// This creates an icon in the left ribbon.
-		// Create an icon that does nothing when clicked, as the effect is from 
 		this.ribbonIconEl = this.addRibbonIcon('calendar-clock', tooltipMessage, () => { });
 
-		// These respond to something being dragged over the ribbon icon and dropped onto it
 		this.ribbonIconEl.addEventListener('dragenter', () => {
-			// Style for is-being-dragged-over is defined in the CSS file.
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', true);
-			// Display a tooltip.
 			const ttPosition = this.ribbonIconEl.getAttribute('data-tooltip-position') as TooltipPlacement;
 			const ttDelay = this.ribbonIconEl.getAttribute('data-tooltip-delay');
 			if (ttPosition != null && ttDelay != null) {
@@ -359,44 +367,24 @@ export default class OutlookMeetingNotes extends Plugin {
 		});
 		this.ribbonIconEl.addEventListener('dragleave', () => {
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
-			// Remove the tooltip when the user leaves the ribbon icon while still dragging.
 			const tooltip = document.getElementsByClassName('tooltip')[0]
 			if (tooltip) { tooltip.remove(); }
 		});
 		this.ribbonIconEl.addEventListener('dragover', (dragevt) => {
-			// User is dragging something over the icon
-
-			// Prevent the default behaviour of not allowing the drop event
 			dragevt.preventDefault();
-			// The dropEffect changes the cursor. Options are 'none', 'move', 'copy', and 'link'.
 			if (dragevt.dataTransfer != null) { dragevt.dataTransfer.dropEffect = 'copy'; }
 		});
 		this.ribbonIconEl.addEventListener('drop', (dropevt) => {
-			// User has dropped something on the icon
-
-			// If the user drops something, dragleave doesn't get called.
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
-
-			// Prevent the default behaviour because we're handling it.
 			dropevt.preventDefault();
-			// Call the custom function defined above.
 			this.handleDropEvent(dropevt);
 		});
 		this.ribbonIconEl.addClass('outlook-meeting-notes-icon');
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		// const statusBarItemEl = this.addStatusBarItem();
-		// statusBarItemEl.setText('Status Bar Text');
-
-		//TODO: Add commands to create meeting notes.
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new OutlookMeetingNotesSettingTab(this.app, this));
 	}
 
-	onunload() {
-		//Don't need to remove event listeners because the icon will be gone.
-	}
+	onunload() { }
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -435,8 +423,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		for (func in helperFunctions) {
 			hash['helper_' + func] = helperFunctions[func];
 		}
-		// Add helper functions to all objects in arrays so that the helper 
-		// functions work inside mustache sections
+		// Add helper functions to array items so they work inside mustache sections
 		for (let property in hash) {
 			if (hash[property] instanceof Array) {
 				for (let subproperty in hash[property]) {
@@ -452,17 +439,10 @@ export default class OutlookMeetingNotes extends Plugin {
 		return hash;
 	}
 
-	//////////////////////
-	// renderTemplate() //
-	//////////////////////
 	// Parse template into YAML and markdown sections to use different escaping for each
 	renderTemplate(template: string, hash: any): string {
-		// Regex /^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s matches '---' at the start of the string,
-		// then a platform-independent new-line, followed by a non-greedy match (because of *?) of any
-		// character including newlines (because of /s at end), followed by another --- on its own line
-		// with either another platform-independent new-line afterwards or the end of the string.
+		// Matches '---' frontmatter block at the start of the string
 		const templateYAMLMatch = template.match(/^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s);
-		// If there was a match, then make notesTemplateMD everything after it, otherwise it's the whole thing.
 		const templateMD = templateYAMLMatch ? template.substring(templateYAMLMatch[0].length) : template;
 
 		let output = ''
@@ -471,7 +451,6 @@ export default class OutlookMeetingNotes extends Plugin {
 			const sanitizeYamlValue = (value: string): string => value.replace(/[><*]/g, '');
 			const mustacheYAMLOptions = {
 				escape: (str: string): string => {
-					// Escape YAML
 					const sanitized = sanitizeYamlValue(str);
 					const found = sanitized.match(/\r\n?|\n/);
 					if (found) {
@@ -528,7 +507,7 @@ class RecurringOccurrenceModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.createEl('h2', { text: 'Recurring meeting' });
-		contentEl.createEl('p', { text: 'This event is recurring. Enter the occurrence date in YYYY-MM-DD format.' });
+		contentEl.createEl('p', { text: 'This event is recurring. Confirm or correct the occurrence date (YYYY-MM-DD).' });
 
 		const inputWrapper = contentEl.createDiv({ cls: 'outlook-meeting-notes-recurring-date-input' });
 		this.input = new TextComponent(inputWrapper);
@@ -649,7 +628,7 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 					'For more information about filename patterns and the syntax for templates, see the '
 				));
 				const link = document.createElement('a');
-				link.href = 'https://www.github.com/davidingerslev/outlook-meeting-notes/#outlook-meeting-notes';
+				link.href = 'https://github.com/nathanstorm689/outlook-meeting-notes-plus#readme';
 				link.target = '_blank';
 				link.rel = 'noopener';
 				link.textContent = 'documentation';
@@ -660,27 +639,3 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 
 	}
 }
-
-/*
- * Notes from the sample plugin README.md
-
-## Releasing new releases
-
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
-
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
-
-## Adding your plugin to the community plugin list
-
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
- */
-
-
