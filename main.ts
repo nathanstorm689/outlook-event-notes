@@ -62,6 +62,10 @@ export default class OutlookMeetingNotes extends Plugin {
 
 			this.ensureBodyField(fileData);
 
+			// For recurring events, apptStartWhole may contain the first occurrence's date
+			// rather than the specific dragged occurrence. Correct it.
+			this.correctRecurringOccurrenceDate(fileData);
+
 			let targetFolderPath = (this.settings.notesFolder ?? '').trim();
 			if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
 			else { targetFolderPath = normalizePath(targetFolderPath); }
@@ -301,6 +305,88 @@ export default class OutlookMeetingNotes extends Plugin {
 		}
 
 		return output;
+	}
+
+	// Convert Outlook recurrence minutes (since midnight Jan 1, 1601, local time) to a moment.
+	private dateFromRecurMinutes(minutes: number): moment.Moment {
+		return moment(new Date(-11644473600000 + minutes * 60000));
+	}
+
+	// For recurring events, apptStartWhole stores the first occurrence's date.
+	// When a later (non-exception) occurrence is dragged, we correct it to the
+	// occurrence closest to today, computed from the recurrence pattern.
+	private correctRecurringOccurrenceDate(fileData: any): void {
+		const apptRecur = fileData.apptRecur;
+		if (!apptRecur?.recurrencePattern) return;
+
+		const rp = apptRecur.recurrencePattern;
+		const apptStart = moment(fileData.apptStartWhole);
+		if (!apptStart.isValid()) return;
+
+		// Compare the date part only (local time) — if they differ, apptStartWhole already
+		// has the correct exception date; leave it alone.
+		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
+		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.local().format('YYYY-MM-DD')) return;
+
+		const closest = this.findClosestOccurrence(apptRecur, moment());
+		if (!closest) return;
+
+		const endStart = moment(fileData.apptEndWhole);
+		if (endStart.isValid()) {
+			const duration = endStart.diff(apptStart, 'minutes');
+			fileData.apptEndWhole = closest.clone().add(duration, 'minutes').toISOString();
+		}
+		fileData.apptStartWhole = closest.toISOString();
+	}
+
+	// Return the occurrence of a recurring series closest to `today`.
+	private findClosestOccurrence(apptRecur: any, today: moment.Moment): moment.Moment | null {
+		try {
+			const rp = apptRecur.recurrencePattern;
+			const timeOffset: number = apptRecur.startTimeOffset ?? 0;
+
+			const firstMidnight = this.dateFromRecurMinutes(rp.startDate);
+			const firstOcc = firstMidnight.clone().startOf('day').add(timeOffset, 'minutes');
+
+			const candidates: moment.Moment[] = [];
+			const freq: number = rp.recurFrequency;
+			const period: number = rp.period;
+
+			if (freq === 8202) { // Daily (period is in minutes)
+				const periodDays = Math.max(1, Math.round(period / 1440));
+				const n = Math.round(today.diff(firstMidnight, 'days') / periodDays);
+				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
+					candidates.push(firstOcc.clone().add(i * periodDays, 'days'));
+			} else if (freq === 8203) { // Weekly (period is in weeks)
+				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << firstMidnight.day());
+				const firstWeekSun = firstMidnight.clone().startOf('week');
+				const n = Math.round(today.diff(firstWeekSun, 'weeks') / period);
+				for (let w = Math.max(0, n - 1); w <= n + 2; w++) {
+					const weekBase = firstWeekSun.clone().add(w * period, 'weeks');
+					for (let d = 0; d < 7; d++)
+						if (dayBits & (1 << d))
+							candidates.push(weekBase.clone().add(d, 'days').add(timeOffset, 'minutes'));
+				}
+			} else if (freq === 8204) { // Monthly (period is in months)
+				const n = Math.round(Math.max(0, today.diff(firstMidnight, 'months')) / period);
+				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
+					candidates.push(firstOcc.clone().add(i * period, 'months'));
+			} else if (freq === 8205) { // Yearly
+				const n = Math.max(0, today.diff(firstMidnight, 'years'));
+				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
+					candidates.push(firstOcc.clone().add(i, 'years'));
+			} else {
+				return null;
+			}
+
+			const valid = candidates.filter(c => !c.isBefore(firstOcc, 'day'));
+			if (valid.length === 0) return firstOcc;
+			return valid.reduce((best, c) =>
+				Math.abs(c.diff(today)) < Math.abs(best.diff(today)) ? c : best
+			);
+		} catch {
+			return null;
+		}
 	}
 
 }
