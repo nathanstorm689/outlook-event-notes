@@ -338,20 +338,26 @@ export default class OutlookMeetingNotes extends Plugin {
 		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
 		if (Math.abs(apptStart.diff(firstOccDate, 'hours')) >= 24) return true;
 
-		const timeOffset: number = apptRecur.startTimeOffset ?? 0;
 		let corrected: moment.Moment | null = null;
+
+		// Helper: given a chosen local date, produce the corrected occurrence moment.
+		// We preserve the original time-of-day from apptStartWhole (in local timezone)
+		// and only swap the calendar date, so the resulting UTC value is correct
+		// regardless of whether the event was created in a different timezone.
+		const withDate = (d: moment.Moment): moment.Moment =>
+			apptStart.clone().year(d.year()).month(d.month()).date(d.date());
 
 		// Try PidLidGlobalObjectId first — most reliable source for native Outlook events.
 		const occDateFromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
 		if (occDateFromId) {
-			corrected = occDateFromId.startOf('day').add(timeOffset, 'minutes');
+			corrected = withDate(occDateFromId);
 		} else {
 			// The .msg file does not encode the specific occurrence date (common for
 			// Google Calendar / third-party events synced to Outlook). Ask the user.
-			const suggested = this.findClosestOccurrence(apptRecur, apptStart, moment());
-			const suggestedStr = suggested
-				? suggested.local().format('YYYY-MM-DD')
-				: apptStart.local().format('YYYY-MM-DD');
+			// Pre-fill with the series start date in local time — it won't be the exact
+			// occurrence for non-first occurrences, but it gives the right time context
+			// and the user can correct it to the actual date they see in Outlook.
+			const suggestedStr = apptStart.local().format('YYYY-MM-DD');
 
 			const userDateStr = await new Promise<string | null>((resolve) => {
 				new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
@@ -361,7 +367,7 @@ export default class OutlookMeetingNotes extends Plugin {
 
 			const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
 			if (!userDate.isValid()) return false;
-			corrected = userDate.startOf('day').add(timeOffset, 'minutes');
+			corrected = withDate(userDate);
 		}
 
 		if (!corrected) return true;
