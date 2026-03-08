@@ -1,4 +1,4 @@
-import { App, displayTooltip, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
+import { App, displayTooltip, Modal, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
 import MsgReader from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
@@ -64,7 +64,8 @@ export default class OutlookMeetingNotes extends Plugin {
 
 			// For recurring events, apptStartWhole may contain the first occurrence's date
 			// rather than the specific dragged occurrence. Correct it.
-			this.correctRecurringOccurrenceDate(fileData);
+			const dateOk = await this.correctRecurringOccurrenceDate(fileData);
+			if (!dateOk) return; // user cancelled the date dialog
 
 			let targetFolderPath = (this.settings.notesFolder ?? '').trim();
 			if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
@@ -155,7 +156,7 @@ export default class OutlookMeetingNotes extends Plugin {
 				const droppedFile = droppedFiles[0];
 
 				const fr = new FileReader();
-				fr.onload = () => {
+				fr.onload = async () => {
 					if (fr.result == null) {
 						throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
 							+ 'a null result property, which should not be possible.');
@@ -164,7 +165,7 @@ export default class OutlookMeetingNotes extends Plugin {
 							+ 'property was not an ArrayBuffer, which should be impossible.');
 					} else {
 						const msgRdr = new MsgReader(fr.result);
-						this.createMeetingNote(msgRdr);
+						await this.createMeetingNote(msgRdr);
 					}
 				}
 				fr.readAsArrayBuffer(droppedFile)
@@ -307,42 +308,59 @@ export default class OutlookMeetingNotes extends Plugin {
 		return output;
 	}
 
+
 	// Convert Outlook recurrence minutes (since midnight Jan 1, 1601, local time) to a moment.
 	private dateFromRecurMinutes(minutes: number): moment.Moment {
 		return moment(new Date(-11644473600000 + minutes * 60000));
 	}
 
 	// For recurring events, apptStartWhole stores the first occurrence's date.
-	// When a later occurrence is dragged, we correct it using:
+	// When a later occurrence is dragged, we try to correct it using:
 	//   1. PidLidGlobalObjectId bytes 16-19, which Outlook sets to the specific
 	//      occurrence's year/month/day (zeros = series master / non-specific).
-	//   2. Fallback: the occurrence closest to today from the recurrence pattern.
-	private correctRecurringOccurrenceDate(fileData: any): void {
+	//   2. If still unknown, show a date-picker dialog pre-filled with the
+	//      occurrence from the recurrence pattern closest to today.
+	// Returns false if the user cancelled the dialog (caller should abort note creation).
+	private async correctRecurringOccurrenceDate(fileData: any): Promise<boolean> {
 		const apptRecur = fileData.apptRecur;
-		if (!apptRecur?.recurrencePattern) return;
+		if (!apptRecur?.recurrencePattern) return true;
 
 		const rp = apptRecur.recurrencePattern;
 		const apptStart = moment(fileData.apptStartWhole);
-		if (!apptStart.isValid()) return;
+		if (!apptStart.isValid()) return true;
 
 		// If apptStartWhole already differs from the series start, Outlook already
 		// provided the correct occurrence date (exception object). Leave it alone.
 		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
-		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.local().format('YYYY-MM-DD')) return;
+		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.local().format('YYYY-MM-DD')) return true;
 
 		const timeOffset: number = apptRecur.startTimeOffset ?? 0;
 		let corrected: moment.Moment | null = null;
 
-		// Try PidLidGlobalObjectId first — most reliable source.
+		// Try PidLidGlobalObjectId first — most reliable source for native Outlook events.
 		const occDateFromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
 		if (occDateFromId) {
-			corrected = occDateFromId.add(timeOffset, 'minutes');
+			corrected = occDateFromId.startOf('day').add(timeOffset, 'minutes');
 		} else {
-			// Fall back to the occurrence closest to today.
-			corrected = this.findClosestOccurrence(apptRecur, moment());
+			// The .msg file does not encode the specific occurrence date (common for
+			// Google Calendar / third-party events synced to Outlook). Ask the user.
+			const suggested = this.findClosestOccurrence(apptRecur, moment());
+			const suggestedStr = suggested
+				? suggested.local().format('YYYY-MM-DD')
+				: apptStart.local().format('YYYY-MM-DD');
+
+			const userDateStr = await new Promise<string | null>((resolve) => {
+				new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
+			});
+
+			if (!userDateStr) return false; // user cancelled
+
+			const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
+			if (!userDate.isValid()) return false;
+			corrected = userDate.startOf('day').add(timeOffset, 'minutes');
 		}
 
-		if (!corrected) return;
+		if (!corrected) return true;
 
 		const endStart = moment(fileData.apptEndWhole);
 		if (endStart.isValid()) {
@@ -350,6 +368,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			fileData.apptEndWhole = corrected.clone().add(duration, 'minutes').toISOString();
 		}
 		fileData.apptStartWhole = corrected.toISOString();
+		return true;
 	}
 
 	// Parse the occurrence date from PidLidGlobalObjectId (as hex string).
@@ -414,6 +433,55 @@ export default class OutlookMeetingNotes extends Plugin {
 		}
 	}
 
+}
+
+// Modal shown when the specific occurrence date cannot be determined from the .msg file.
+// The user can confirm or correct the pre-filled date before the note is created.
+class OccurrenceDateModal extends Modal {
+	private dateStr: string;
+	private readonly onSubmit: (date: string | null) => void;
+
+	constructor(app: App, suggestedDate: string, onSubmit: (date: string | null) => void) {
+		super(app);
+		this.dateStr = suggestedDate;
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl('h3', { text: 'Confirm occurrence date' });
+		contentEl.createEl('p', {
+			text: 'The date of this recurring event occurrence could not be determined automatically. '
+				+ 'Please confirm or correct the date:'
+		});
+
+		new Setting(contentEl)
+			.setName('Event date')
+			.addText(text => {
+				text.inputEl.type = 'date';
+				text.setValue(this.dateStr);
+				text.onChange(value => { this.dateStr = value; });
+			});
+
+		new Setting(contentEl)
+			.addButton(btn => btn
+				.setButtonText('Create note')
+				.setCta()
+				.onClick(() => {
+					this.close();
+					this.onSubmit(this.dateStr);
+				}))
+			.addButton(btn => btn
+				.setButtonText('Cancel')
+				.onClick(() => {
+					this.close();
+					this.onSubmit(null);
+				}));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
 }
 
 class OutlookMeetingNotesSettingTab extends PluginSettingTab {
