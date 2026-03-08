@@ -440,6 +440,7 @@ export default class OutlookMeetingNotes extends Plugin {
 class OccurrenceDateModal extends Modal {
 	private dateStr: string;
 	private readonly onSubmit: (date: string | null) => void;
+	private resolved = false;
 
 	constructor(app: App, suggestedDate: string, onSubmit: (date: string | null) => void) {
 		super(app);
@@ -447,12 +448,18 @@ class OccurrenceDateModal extends Modal {
 		this.onSubmit = onSubmit;
 	}
 
+	private resolve(date: string | null): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.onSubmit(date);
+	}
+
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.createEl('h3', { text: 'Confirm occurrence date' });
 		contentEl.createEl('p', {
 			text: 'The date of this recurring event occurrence could not be determined automatically. '
-				+ 'Please confirm or correct the date:'
+				+ 'Please confirm or correct the date (YYYY-MM-DD):'
 		});
 
 		new Setting(contentEl)
@@ -461,26 +468,24 @@ class OccurrenceDateModal extends Modal {
 				text.inputEl.type = 'date';
 				text.setValue(this.dateStr);
 				text.onChange(value => { this.dateStr = value; });
+				text.inputEl.addEventListener('keydown', (e) => {
+					if (e.key === 'Enter') { this.resolve(this.dateStr); this.close(); }
+				});
 			});
 
 		new Setting(contentEl)
 			.addButton(btn => btn
 				.setButtonText('Create note')
 				.setCta()
-				.onClick(() => {
-					this.close();
-					this.onSubmit(this.dateStr);
-				}))
+				.onClick(() => { this.resolve(this.dateStr); this.close(); }))
 			.addButton(btn => btn
 				.setButtonText('Cancel')
-				.onClick(() => {
-					this.close();
-					this.onSubmit(null);
-				}));
+				.onClick(() => { this.resolve(null); this.close(); }));
 	}
 
 	onClose(): void {
 		this.contentEl.empty();
+		this.resolve(null); // no-op if already resolved via a button
 	}
 }
 
