@@ -313,8 +313,10 @@ export default class OutlookMeetingNotes extends Plugin {
 	}
 
 	// For recurring events, apptStartWhole stores the first occurrence's date.
-	// When a later (non-exception) occurrence is dragged, we correct it to the
-	// occurrence closest to today, computed from the recurrence pattern.
+	// When a later occurrence is dragged, we correct it using:
+	//   1. PidLidGlobalObjectId bytes 16-19, which Outlook sets to the specific
+	//      occurrence's year/month/day (zeros = series master / non-specific).
+	//   2. Fallback: the occurrence closest to today from the recurrence pattern.
 	private correctRecurringOccurrenceDate(fileData: any): void {
 		const apptRecur = fileData.apptRecur;
 		if (!apptRecur?.recurrencePattern) return;
@@ -323,20 +325,43 @@ export default class OutlookMeetingNotes extends Plugin {
 		const apptStart = moment(fileData.apptStartWhole);
 		if (!apptStart.isValid()) return;
 
-		// Compare the date part only (local time) — if they differ, apptStartWhole already
-		// has the correct exception date; leave it alone.
+		// If apptStartWhole already differs from the series start, Outlook already
+		// provided the correct occurrence date (exception object). Leave it alone.
 		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
 		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.local().format('YYYY-MM-DD')) return;
 
-		const closest = this.findClosestOccurrence(apptRecur, moment());
-		if (!closest) return;
+		const timeOffset: number = apptRecur.startTimeOffset ?? 0;
+		let corrected: moment.Moment | null = null;
+
+		// Try PidLidGlobalObjectId first — most reliable source.
+		const occDateFromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
+		if (occDateFromId) {
+			corrected = occDateFromId.add(timeOffset, 'minutes');
+		} else {
+			// Fall back to the occurrence closest to today.
+			corrected = this.findClosestOccurrence(apptRecur, moment());
+		}
+
+		if (!corrected) return;
 
 		const endStart = moment(fileData.apptEndWhole);
 		if (endStart.isValid()) {
 			const duration = endStart.diff(apptStart, 'minutes');
-			fileData.apptEndWhole = closest.clone().add(duration, 'minutes').toISOString();
+			fileData.apptEndWhole = corrected.clone().add(duration, 'minutes').toISOString();
 		}
-		fileData.apptStartWhole = closest.toISOString();
+		fileData.apptStartWhole = corrected.toISOString();
+	}
+
+	// Parse the occurrence date from PidLidGlobalObjectId (as hex string).
+	// Bytes 16-17 = year (big-endian), 18 = month, 19 = day.
+	// Returns null when the bytes are all zero (series master, not occurrence-specific).
+	private getOccurrenceDateFromGlobalId(hexStr: string | undefined): moment.Moment | null {
+		if (!hexStr || hexStr.length < 40) return null;
+		const year = (parseInt(hexStr.substring(32, 34), 16) << 8) | parseInt(hexStr.substring(34, 36), 16);
+		const month = parseInt(hexStr.substring(36, 38), 16);
+		const day = parseInt(hexStr.substring(38, 40), 16);
+		if (year === 0 || month === 0 || day === 0) return null;
+		return moment({ year, month: month - 1, day }); // month is 0-indexed in moment
 	}
 
 	// Return the occurrence of a recurring series closest to `today`.
