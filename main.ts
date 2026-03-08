@@ -40,12 +40,7 @@ export default class OutlookMeetingNotes extends Plugin {
 
 	async createMeetingNote(msg: MsgReader) {
 		try {
-			const { vault } = this.app;
-
-			// Get the file data from MsgReader
 			const origFileData = msg.getFileData();
-
-			// Check if we got a suitable meeting
 			if (origFileData.dataType != 'msg') {
 				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'MsgReader did not parse the file as valid msg format.');
@@ -53,60 +48,63 @@ export default class OutlookMeetingNotes extends Plugin {
 				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'It is a valid msg file but not an appointment or meeting.');
 			}
-
-			this.addHelperFunctions(origFileData);
-
-			// Add helper field for the current date and time
-			let fileData = origFileData as any;
-			fileData.helper_currentDT = moment().format();
-
-			this.ensureBodyField(fileData);
-
-			// For recurring events, apptStartWhole may contain the first occurrence's date
-			// rather than the specific dragged occurrence. Correct it.
-			const dateOk = await this.correctRecurringOccurrenceDate(fileData);
-			if (!dateOk) return; // user cancelled the date dialog
-
-			let targetFolderPath = (this.settings.notesFolder ?? '').trim();
-			if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
-			else { targetFolderPath = normalizePath(targetFolderPath); }
-			const fileNameEscape = {
-				escape: (str: string): string => {
-					return str.replaceAll('/', this.settings.invalidFilenameCharReplacement);
-				}
-			}
-			const fileNameMustache = Mustache.render(
-				this.settings.fileNamePattern,
-				proxyData(fileData),
-				undefined,
-				fileNameEscape)
-				.replaceAll(/[*\"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
-			const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
-			const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
-			let meetingNoteFile = vault.getFileByPath(filePath);
-			if (meetingNoteFile) {
-				// File already exists
-				new Notice(meetingNoteFile.basename + ' already exists: opening it');
-			}
-			else {
-				if (targetFolderPath !== '' && vault.getFolderByPath(targetFolderPath) == null) {
-					await vault.createFolder(targetFolderPath);
-				}
-				const mustacheOutput = this.renderTemplate(
-					this.settings.notesTemplate,
-					fileData);
-				meetingNoteFile = await vault.create(filePath, mustacheOutput);
-				new Notice('New file created: ' + meetingNoteFile.basename);
-			}
-			const openInNewTab = false;
-			this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
-			// @ts-ignore: Property 'internalPlugins' does not exist on type 'App'.
-			const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
-			if (fe) { fe.revealInFolder(meetingNoteFile); }
+			await this.createNoteFromFileData(origFileData as any);
 		} catch (ee: unknown) {
 			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
 		}
+	}
+
+	// Shared note-creation logic used by both the .msg path and the .ics path.
+	// fileData must have: subject, apptStartWhole, apptEndWhole, apptLocation,
+	// body/bodyText/bodyHtml, recipients[], apptRecur (null = skip date correction).
+	private async createNoteFromFileData(origFileData: any): Promise<void> {
+		const { vault } = this.app;
+
+		this.addHelperFunctions(origFileData);
+		let fileData = origFileData;
+		fileData.helper_currentDT = moment().format();
+
+		this.ensureBodyField(fileData);
+
+		// For recurring .msg events, apptStartWhole may carry only the series start date.
+		// correctRecurringOccurrenceDate fixes it (or asks the user).
+		// For .ics files apptRecur is null, so this returns true immediately.
+		const dateOk = await this.correctRecurringOccurrenceDate(fileData);
+		if (!dateOk) return; // user cancelled the date dialog
+
+		let targetFolderPath = (this.settings.notesFolder ?? '').trim();
+		if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
+		else { targetFolderPath = normalizePath(targetFolderPath); }
+		const fileNameEscape = {
+			escape: (str: string): string => {
+				return str.replaceAll('/', this.settings.invalidFilenameCharReplacement);
+			}
+		}
+		const fileNameMustache = Mustache.render(
+			this.settings.fileNamePattern,
+			proxyData(fileData),
+			undefined,
+			fileNameEscape)
+			.replaceAll(/[*\"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
+		const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
+		const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
+		let meetingNoteFile = vault.getFileByPath(filePath);
+		if (meetingNoteFile) {
+			new Notice(meetingNoteFile.basename + ' already exists: opening it');
+		} else {
+			if (targetFolderPath !== '' && vault.getFolderByPath(targetFolderPath) == null) {
+				await vault.createFolder(targetFolderPath);
+			}
+			const mustacheOutput = this.renderTemplate(this.settings.notesTemplate, fileData);
+			meetingNoteFile = await vault.create(filePath, mustacheOutput);
+			new Notice('New file created: ' + meetingNoteFile.basename);
+		}
+		const openInNewTab = false;
+		this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
+		// @ts-ignore: Property 'internalPlugins' does not exist on type 'App'.
+		const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
+		if (fe) { fe.revealInFolder(meetingNoteFile); }
 	}
 
 	private ensureBodyField(fileData: any): void {
@@ -142,33 +140,53 @@ export default class OutlookMeetingNotes extends Plugin {
 	}
 
 	// Handle a file being dropped onto the ribbon icon.
+	// Accepts both Outlook .msg files and iCalendar .ics files.
+	// Drag a meeting directly from the Outlook Calendar view to get an .ics file
+	// whose DTSTART is always the exact occurrence date (no dialog needed).
 	async handleDropEvent(dropevt: DragEvent) {
 		if (dropevt.dataTransfer == null) {
 			throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The event had a null '
 				+ 'dataTransfer property, which should never happen when dispatched by the browser, according '
 				+ 'to https://developer.mozilla.org/en-US/docs/Web/API/DragEvent/dataTransfer');
 		} else {
-			const droppedFiles = dropevt.dataTransfer.files
+			const droppedFiles = dropevt.dataTransfer.files;
 			if (droppedFiles.length != 1) {
 				new Notice('Outlook Event Notes can only handle one meeting being dropped onto the ribbon icon');
-			}
-			else {
+			} else {
 				const droppedFile = droppedFiles[0];
+				const isIcs = droppedFile.name.toLowerCase().endsWith('.ics')
+					|| droppedFile.type === 'text/calendar';
 
-				const fr = new FileReader();
-				fr.onload = async () => {
-					if (fr.result == null) {
-						throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
-							+ 'a null result property, which should not be possible.');
-					} else if (!(fr.result instanceof ArrayBuffer)) {
-						throw new TypeError('Outlook Event Notes cannot handle the DragEvent. The FileReader result '
-							+ 'property was not an ArrayBuffer, which should be impossible.');
-					} else {
-						const msgRdr = new MsgReader(fr.result);
-						await this.createMeetingNote(msgRdr);
-					}
+				if (isIcs) {
+					// iCalendar file: read as text and parse.
+					// DTSTART is always the correct occurrence date → no dialog needed.
+					const fr = new FileReader();
+					fr.onload = async () => {
+						try {
+							const fileData = this.parseIcsFile(fr.result as string);
+							await this.createNoteFromFileData(fileData);
+						} catch (ee: unknown) {
+							if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
+						}
+					};
+					fr.readAsText(droppedFile, 'utf-8');
+				} else {
+					// Outlook .msg binary file
+					const fr = new FileReader();
+					fr.onload = async () => {
+						if (fr.result == null) {
+							throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
+								+ 'a null result property, which should not be possible.');
+						} else if (!(fr.result instanceof ArrayBuffer)) {
+							throw new TypeError('Outlook Event Notes cannot handle the DragEvent. The FileReader result '
+								+ 'property was not an ArrayBuffer, which should be impossible.');
+						} else {
+							const msgRdr = new MsgReader(fr.result);
+							await this.createMeetingNote(msgRdr);
+						}
+					};
+					fr.readAsArrayBuffer(droppedFile);
 				}
-				fr.readAsArrayBuffer(droppedFile)
 			}
 		}
 	}
@@ -308,6 +326,96 @@ export default class OutlookMeetingNotes extends Plugin {
 		return output;
 	}
 
+
+	// Parse an iCalendar (.ics) file and return a fileData object compatible with
+	// createNoteFromFileData. DTSTART in .ics files is always the correct occurrence
+	// date (Outlook sets it to the specific occurrence when dragging from calendar view),
+	// so apptRecur is set to null to skip the recurring-event correction dialog.
+	private parseIcsFile(content: string): any {
+		// RFC 5545 §3.1: unfold continuation lines (lines starting with whitespace)
+		const text = content
+			.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+			.replace(/\n[ \t]/g, '');
+
+		// Find first VEVENT block
+		const m = text.match(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/i);
+		if (!m) throw new TypeError('The .ics file does not contain a VEVENT block.');
+		const block = m[1];
+
+		// Parse all property lines: NAME or NAME;PARAM=VAL:value
+		const propMap = new Map<string, Array<{ value: string; params: Record<string, string> }>>();
+		for (const line of block.split('\n')) {
+			const colon = line.indexOf(':');
+			if (colon === -1) continue;
+			const keyFull = line.slice(0, colon);
+			const value = line.slice(colon + 1).trimEnd();
+			const semi = keyFull.indexOf(';');
+			const name = (semi === -1 ? keyFull : keyFull.slice(0, semi)).toUpperCase();
+			const paramStr = semi === -1 ? '' : keyFull.slice(semi + 1);
+			const params: Record<string, string> = {};
+			for (const seg of paramStr.split(';').filter(Boolean)) {
+				const eq = seg.indexOf('=');
+				if (eq !== -1) {
+					params[seg.slice(0, eq).toUpperCase()] =
+						seg.slice(eq + 1).replace(/^"(.*)"$/, '$1');
+				}
+			}
+			if (!propMap.has(name)) propMap.set(name, []);
+			propMap.get(name)!.push({ value, params });
+		}
+
+		const get = (name: string) => propMap.get(name)?.[0];
+
+		// Unescape RFC 5545 text values
+		const unescape = (s: string) =>
+			s.replace(/\\n/gi, '\n').replace(/\\,/g, ',')
+				.replace(/\\;/g, ';').replace(/\\\\/g, '\\');
+
+		// Parse a date/time property to a moment.
+		// UTC times end with Z; TZID times are parsed as local (assumes the
+		// computer's timezone matches the event's timezone, which is the common case).
+		const parseDT = (prop: { value: string; params: Record<string, string> } | undefined)
+			: moment.Moment | undefined => {
+			if (!prop) return undefined;
+			const v = prop.value.replace(/\s/g, '');
+			if (v.endsWith('Z')) {
+				const clean = v.slice(0, -1);
+				return moment.utc(clean, clean.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
+			}
+			return moment(v, v.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
+		};
+
+		// Parse attendees (ATTENDEE;CN=...:mailto:email)
+		const recipients: Array<{ name: string; email: string }> = [];
+		for (const att of propMap.get('ATTENDEE') ?? []) {
+			const emailM = att.value.match(/mailto:(.+)/i);
+			if (!emailM) continue;
+			const email = emailM[1].trim();
+			const cn = att.params['CN'];
+			recipients.push({ name: cn ? unescape(cn) : email, email });
+		}
+
+		const summaryProp = get('SUMMARY');
+		const dtstart = get('DTSTART');
+		const dtend = get('DTEND');
+		const locationProp = get('LOCATION');
+		const descProp = get('DESCRIPTION');
+
+		if (!summaryProp) throw new TypeError('The .ics file is missing a SUMMARY (event title).');
+		if (!dtstart) throw new TypeError('The .ics file is missing a DTSTART (start date).');
+
+		return {
+			dataType: 'msg',                  // satisfies createMeetingNote validation path
+			messageClass: 'IPM.Appointment',
+			subject: unescape(summaryProp.value),
+			apptStartWhole: parseDT(dtstart)?.toISOString(),
+			apptEndWhole: parseDT(dtend)?.toISOString(),
+			apptLocation: locationProp ? unescape(locationProp.value) : '',
+			body: descProp ? unescape(descProp.value) : '',
+			recipients,
+			apptRecur: null,  // DTSTART already has the correct occurrence date
+		};
+	}
 
 	// Convert Outlook recurrence minutes (since midnight Jan 1, 1601, local time) to a moment.
 	private dateFromRecurMinutes(minutes: number): moment.Moment {
