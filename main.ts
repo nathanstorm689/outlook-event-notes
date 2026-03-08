@@ -331,8 +331,12 @@ export default class OutlookMeetingNotes extends Plugin {
 
 		// If apptStartWhole already differs from the series start, Outlook already
 		// provided the correct occurrence date (exception object). Leave it alone.
+		// We compare by difference in hours rather than by local calendar date
+		// because apptStartWhole and startDate can be on different calendar days
+		// in local time (e.g. apptStartWhole = 23:00 UTC = 01:00 the next day in
+		// UTC+2). A gap ≥ 24 h means they represent different occurrences.
 		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
-		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.local().format('YYYY-MM-DD')) return true;
+		if (Math.abs(apptStart.diff(firstOccDate, 'hours')) >= 24) return true;
 
 		const timeOffset: number = apptRecur.startTimeOffset ?? 0;
 		let corrected: moment.Moment | null = null;
@@ -344,7 +348,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		} else {
 			// The .msg file does not encode the specific occurrence date (common for
 			// Google Calendar / third-party events synced to Outlook). Ask the user.
-			const suggested = this.findClosestOccurrence(apptRecur, moment());
+			const suggested = this.findClosestOccurrence(apptRecur, apptStart, moment());
 			const suggestedStr = suggested
 				? suggested.local().format('YYYY-MM-DD')
 				: apptStart.local().format('YYYY-MM-DD');
@@ -384,13 +388,15 @@ export default class OutlookMeetingNotes extends Plugin {
 	}
 
 	// Return the occurrence of a recurring series closest to `today`.
-	private findClosestOccurrence(apptRecur: any, today: moment.Moment): moment.Moment | null {
+	// baseTime is apptStartWhole as a moment — the first occurrence with the
+	// correct timezone. Using it as the anchor avoids the one-day-off error that
+	// arises when startDate (always midnight UTC) is converted to local time.
+	private findClosestOccurrence(apptRecur: any, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
 		try {
 			const rp = apptRecur.recurrencePattern;
-			const timeOffset: number = apptRecur.startTimeOffset ?? 0;
 
-			const firstMidnight = this.dateFromRecurMinutes(rp.startDate);
-			const firstOcc = firstMidnight.clone().startOf('day').add(timeOffset, 'minutes');
+			// Local-time midnight of baseTime, used for day-level period arithmetic.
+			const firstMidnight = baseTime.clone().startOf('day');
 
 			const candidates: moment.Moment[] = [];
 			const freq: number = rp.recurFrequency;
@@ -400,31 +406,32 @@ export default class OutlookMeetingNotes extends Plugin {
 				const periodDays = Math.max(1, Math.round(period / 1440));
 				const n = Math.round(today.diff(firstMidnight, 'days') / periodDays);
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(firstOcc.clone().add(i * periodDays, 'days'));
+					candidates.push(baseTime.clone().add(i * periodDays, 'days'));
 			} else if (freq === 8203) { // Weekly (period is in weeks)
-				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << firstMidnight.day());
+				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << baseTime.day());
 				const firstWeekSun = firstMidnight.clone().startOf('week');
 				const n = Math.round(today.diff(firstWeekSun, 'weeks') / period);
 				for (let w = Math.max(0, n - 1); w <= n + 2; w++) {
 					const weekBase = firstWeekSun.clone().add(w * period, 'weeks');
 					for (let d = 0; d < 7; d++)
 						if (dayBits & (1 << d))
-							candidates.push(weekBase.clone().add(d, 'days').add(timeOffset, 'minutes'));
+							candidates.push(weekBase.clone().add(d, 'days')
+								.add(baseTime.hours() * 60 + baseTime.minutes(), 'minutes'));
 				}
 			} else if (freq === 8204) { // Monthly (period is in months)
 				const n = Math.round(Math.max(0, today.diff(firstMidnight, 'months')) / period);
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(firstOcc.clone().add(i * period, 'months'));
+					candidates.push(baseTime.clone().add(i * period, 'months'));
 			} else if (freq === 8205) { // Yearly
 				const n = Math.max(0, today.diff(firstMidnight, 'years'));
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(firstOcc.clone().add(i, 'years'));
+					candidates.push(baseTime.clone().add(i, 'years'));
 			} else {
 				return null;
 			}
 
-			const valid = candidates.filter(c => !c.isBefore(firstOcc, 'day'));
-			if (valid.length === 0) return firstOcc;
+			const valid = candidates.filter(c => !c.isBefore(baseTime, 'day'));
+			if (valid.length === 0) return baseTime;
 			return valid.reduce((best, c) =>
 				Math.abs(c.diff(today)) < Math.abs(best.diff(today)) ? c : best
 			);
