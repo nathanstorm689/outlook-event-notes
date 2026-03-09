@@ -38,7 +38,10 @@ const DEFAULT_SETTINGS: OutlookMeetingNotesSettings = {
 export default class OutlookMeetingNotes extends Plugin {
 	settings: OutlookMeetingNotesSettings;
 
-	async createMeetingNote(msg: MsgReader) {
+	// dragText: the plain-text representation of the appointment from the DataTransfer.
+	// Outlook Classic puts it there when dragging from the calendar; it contains the
+	// occurrence's actual "Start:" date, which lets us skip the manual-date dialog.
+	async createMeetingNote(msg: MsgReader, dragText = '') {
 		try {
 			const origFileData = msg.getFileData();
 			if (origFileData.dataType != 'msg') {
@@ -48,7 +51,7 @@ export default class OutlookMeetingNotes extends Plugin {
 				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'It is a valid msg file but not an appointment or meeting.');
 			}
-			await this.createNoteFromFileData(origFileData as any);
+			await this.createNoteFromFileData(origFileData as any, dragText);
 		} catch (ee: unknown) {
 			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
@@ -58,7 +61,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// Shared note-creation logic used by both the .msg path and the .ics path.
 	// fileData must have: subject, apptStartWhole, apptEndWhole, apptLocation,
 	// body/bodyText/bodyHtml, recipients[], apptRecur (null = skip date correction).
-	private async createNoteFromFileData(origFileData: any): Promise<void> {
+	private async createNoteFromFileData(origFileData: any, dragText = ''): Promise<void> {
 		const { vault } = this.app;
 
 		this.addHelperFunctions(origFileData);
@@ -68,9 +71,9 @@ export default class OutlookMeetingNotes extends Plugin {
 		this.ensureBodyField(fileData);
 
 		// For recurring .msg events, apptStartWhole may carry only the series start date.
-		// correctRecurringOccurrenceDate fixes it (or asks the user).
+		// correctRecurringOccurrenceDate fixes it (using drag text, GlobalObjectId, or dialog).
 		// For .ics files apptRecur is null, so this returns true immediately.
-		const dateOk = await this.correctRecurringOccurrenceDate(fileData);
+		const dateOk = await this.correctRecurringOccurrenceDate(fileData, dragText);
 		if (!dateOk) return; // user cancelled the date dialog
 
 		let targetFolderPath = (this.settings.notesFolder ?? '').trim();
@@ -171,7 +174,13 @@ export default class OutlookMeetingNotes extends Plugin {
 					};
 					fr.readAsText(droppedFile, 'utf-8');
 				} else {
-					// Outlook .msg binary file
+					// Outlook .msg binary file.
+					// Read the plain-text representation NOW (before the async FileReader),
+					// while dataTransfer is still accessible. Outlook Classic puts the
+					// appointment text here when dragging from the calendar view, including
+					// the occurrence's actual "Start:" / "Début :" date.
+					const dragText = dropevt.dataTransfer?.getData('text/plain') ?? '';
+
 					const fr = new FileReader();
 					fr.onload = async () => {
 						if (fr.result == null) {
@@ -182,7 +191,7 @@ export default class OutlookMeetingNotes extends Plugin {
 								+ 'property was not an ArrayBuffer, which should be impossible.');
 						} else {
 							const msgRdr = new MsgReader(fr.result);
-							await this.createMeetingNote(msgRdr);
+							await this.createMeetingNote(msgRdr, dragText);
 						}
 					};
 					fr.readAsArrayBuffer(droppedFile);
@@ -429,7 +438,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	//   2. If still unknown, show a date-picker dialog pre-filled with the
 	//      occurrence from the recurrence pattern closest to today.
 	// Returns false if the user cancelled the dialog (caller should abort note creation).
-	private async correctRecurringOccurrenceDate(fileData: any): Promise<boolean> {
+	private async correctRecurringOccurrenceDate(fileData: any, dragText = ''): Promise<boolean> {
 		const apptRecur = fileData.apptRecur;
 		if (!apptRecur?.recurrencePattern) return true;
 
@@ -460,22 +469,28 @@ export default class OutlookMeetingNotes extends Plugin {
 		if (occDateFromId) {
 			corrected = withDate(occDateFromId);
 		} else {
-			// The .msg file does not encode the specific occurrence date (common for
-			// Google Calendar / third-party events synced to Outlook). Ask the user.
-			// Pre-fill with the series start date in local time — it won't be the exact
-			// occurrence for non-first occurrences, but it gives the right time context
-			// and the user can correct it to the actual date they see in Outlook.
-			const suggestedStr = apptStart.local().format('YYYY-MM-DD');
+			// Try to parse the occurrence date from the plain-text representation that
+			// Outlook Classic puts in the DataTransfer when dragging from the calendar.
+			// The text includes a "Start:" / "Début :" line with the exact occurrence date,
+			// which lets us skip the dialog entirely for most Outlook Classic drag operations.
+			const parsedDate = dragText ? this.parseDateFromDragText(dragText) : null;
+			if (parsedDate) {
+				corrected = withDate(parsedDate);
+			} else {
+				// Could not extract the date automatically — show a date-picker dialog.
+				// Pre-fill with the series start date in local time as a reasonable hint.
+				const suggestedStr = apptStart.local().format('YYYY-MM-DD');
 
-			const userDateStr = await new Promise<string | null>((resolve) => {
-				new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
-			});
+				const userDateStr = await new Promise<string | null>((resolve) => {
+					new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
+				});
 
-			if (!userDateStr) return false; // user cancelled
+				if (!userDateStr) return false; // user cancelled
 
-			const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
-			if (!userDate.isValid()) return false;
-			corrected = withDate(userDate);
+				const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
+				if (!userDate.isValid()) return false;
+				corrected = withDate(userDate);
+			}
 		}
 
 		if (!corrected) return true;
@@ -499,6 +514,66 @@ export default class OutlookMeetingNotes extends Plugin {
 		const day = parseInt(hexStr.substring(38, 40), 16);
 		if (year === 0 || month === 0 || day === 0) return null;
 		return moment({ year, month: month - 1, day }); // month is 0-indexed in moment
+	}
+
+	// Try to extract the occurrence start date from the plain-text representation
+	// that Outlook Classic puts in the DataTransfer when the user drags a calendar
+	// event. The text contains a line like:
+	//   English: "Start:   Wednesday, October 15, 2025 9:30 PM"
+	//   French:  "Début :  mercredi 15 octobre 2025 21:30"
+	// Returns null if no parseable date is found (caller should fall back to dialog).
+	private parseDateFromDragText(text: string): moment.Moment | null {
+		// Locate the Start / Début line. Handles:
+		//   • space before colon  ("Début :")
+		//   • tab between colon and value
+		//   • all keyword variants (Start / Début / Debut / Begin)
+		const lineMatch = text.match(/^(?:start|d[eé]but|begin)\s*:\s*(.+)$/im);
+		if (!lineMatch) return null;
+		const rawDate = lineMatch[1].trim();
+		if (!rawDate) return null;
+
+		// locale → strict-mode formats to attempt
+		const localeFormats: Array<[string, string[]]> = [
+			['fr', [
+				'dddd D MMMM YYYY HH:mm',	// mercredi 15 octobre 2025 21:30
+				'dddd D MMMM YYYY H:mm',
+				'dddd D MMMM YYYY',
+				'D/M/YYYY HH:mm',
+				'D/M/YYYY H:mm',
+			]],
+			['fr-ca', [
+				'dddd D MMMM YYYY HH:mm',
+				'dddd D MMMM YYYY H:mm',
+				'dddd D MMMM YYYY',
+			]],
+			['en', [
+				'dddd, MMMM D, YYYY h:mm A',	// Wednesday, October 15, 2025 9:30 PM
+				'dddd, MMMM D, YYYY HH:mm',
+				'dddd MMMM D, YYYY h:mm A',
+				'dddd MMMM D YYYY h:mm A',
+				'M/D/YYYY h:mm A',
+				'M/D/YYYY HH:mm',
+			]],
+		];
+
+		const savedLocale = moment.locale();
+		try {
+			for (const [locale, formats] of localeFormats) {
+				moment.locale(locale);
+				for (const fmt of formats) {
+					const m = moment(rawDate, fmt, locale, true);
+					if (m.isValid()) return m;
+				}
+			}
+			// Last resort: let moment parse without strict mode.
+			// Guard against garbage: require a plausible year range.
+			moment.locale(savedLocale);
+			const loose = moment(rawDate);
+			if (loose.isValid() && loose.year() >= 2000 && loose.year() <= 2100) return loose;
+		} finally {
+			moment.locale(savedLocale);
+		}
+		return null;
 	}
 
 	// Return the occurrence of a recurring series closest to `today`.
