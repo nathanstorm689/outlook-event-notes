@@ -10,7 +10,7 @@ const OutlookMeetingNotesDefaultFilenamePattern =
 const OutlookMeetingNotesDefaultTemplate = `---
 title: {{subject}}
 subtitle: meeting notes
-date: {{#helper_dateFormat}}{{apptStartWhole}}|L LT{{/helper_dateFormat}}
+created: {{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm-ss{{/helper_dateFormat}}
 meeting: 'true'
 meeting-location: {{apptLocation}}
 meeting-recipients:
