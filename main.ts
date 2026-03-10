@@ -670,12 +670,12 @@ class OccurrenceDateModal extends Modal {
 		const { contentEl } = this;
 		contentEl.createEl('h3', { text: 'Confirm occurrence date' });
 		contentEl.createEl('p', {
-			text: 'The specific occurrence date could not be read from this .msg file. '
-				+ 'This is normal for Google Calendar events synced to Outlook — every '
-				+ 'occurrence produces an identical file with only the series start date. '
+			text: 'This is an occurrence of a recurrent event. '
+				+ 'It is not possible to read the date of an occurrence of a recurrent event. '
+				+ 'Every occurrence produces an identical file with only the series start date. '
 				+ 'The field below is pre-filled with the occurrence nearest to today. '
 				+ 'Confirm if that is the event you dragged, or correct it to match '
-				+ 'the date shown in your Outlook calendar.'
+				+ 'the date shown in your calendar.'
 		});
 
 		new Setting(contentEl)
