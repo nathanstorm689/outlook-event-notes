@@ -487,8 +487,15 @@ export default class OutlookMeetingNotes extends Plugin {
 				corrected = withDate(parsedDate!);
 			} else {
 				// Could not extract the date automatically — show a date-picker dialog.
-				// Pre-fill with the series start date in local time as a reasonable hint.
-				const suggestedStr = apptStart.local().format('YYYY-MM-DD');
+				// Pre-fill with the occurrence nearest to today (rather than the series
+				// start) because users typically drag an upcoming or recent meeting.
+				// For a yearly event in March 2026, this correctly lands on 2026-07-26
+				// instead of the series-start 2021-07-26 that would otherwise appear.
+				// Falls back to the series start if the recurrence type is unrecognised.
+				const closestOcc = this.findClosestOccurrence(apptRecur, apptStart, moment());
+				const suggestedStr = closestOcc
+					? closestOcc.local().format('YYYY-MM-DD')
+					: apptStart.local().format('YYYY-MM-DD');
 
 				const userDateStr = await new Promise<string | null>((resolve) => {
 					new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
@@ -663,8 +670,12 @@ class OccurrenceDateModal extends Modal {
 		const { contentEl } = this;
 		contentEl.createEl('h3', { text: 'Confirm occurrence date' });
 		contentEl.createEl('p', {
-			text: 'The date of this recurring event occurrence could not be determined automatically. '
-				+ 'Please confirm or correct the date (YYYY-MM-DD):'
+			text: 'The specific occurrence date could not be read from this .msg file. '
+				+ 'This is normal for Google Calendar events synced to Outlook — every '
+				+ 'occurrence produces an identical file with only the series start date. '
+				+ 'The field below is pre-filled with the occurrence nearest to today. '
+				+ 'Confirm if that is the event you dragged, or correct it to match '
+				+ 'the date shown in your Outlook calendar.'
 		});
 
 		new Setting(contentEl)
