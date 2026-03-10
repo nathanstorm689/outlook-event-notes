@@ -446,14 +446,20 @@ export default class OutlookMeetingNotes extends Plugin {
 		const apptStart = moment(fileData.apptStartWhole);
 		if (!apptStart.isValid()) return true;
 
-		// If apptStartWhole already differs from the series start, Outlook already
-		// provided the correct occurrence date (exception object). Leave it alone.
-		// We compare by difference in hours rather than by local calendar date
-		// because apptStartWhole and startDate can be on different calendar days
-		// in local time (e.g. apptStartWhole = 23:00 UTC = 01:00 the next day in
-		// UTC+2). A gap ≥ 24 h means they represent different occurrences.
+		// Early-exit: if apptStartWhole is already on a different local calendar day
+		// than the series start, Outlook stored the correct occurrence — leave it alone.
+		//
+		// Key invariant: dateFromRecurMinutes(startDate) always produces a moment
+		// whose UTC date equals the series-start LOCAL calendar date (midnight-local
+		// is encoded as an offset from midnight-UTC-1601, so the UTC date = local date).
+		// Therefore: compare apptStart.local() (the event's local date) with
+		// firstOccDate.utc() (which carries the series-start calendar date).
+		//
+		// The old ">= 24 h diff" check broke for UTC−4/UTC−5 evening events: an event
+		// at 21:30 EDT stores apptStartWhole as ~01:30 UTC the next day, making the
+		// diff ≥ 24 h even though both represent the same local calendar day.
 		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
-		if (Math.abs(apptStart.diff(firstOccDate, 'hours')) >= 24) return true;
+		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD')) return true;
 
 		let corrected: moment.Moment | null = null;
 
@@ -469,13 +475,16 @@ export default class OutlookMeetingNotes extends Plugin {
 		if (occDateFromId) {
 			corrected = withDate(occDateFromId);
 		} else {
-			// Try to parse the occurrence date from the plain-text representation that
-			// Outlook Classic puts in the DataTransfer when dragging from the calendar.
-			// The text includes a "Start:" / "Début :" line with the exact occurrence date,
-			// which lets us skip the dialog entirely for most Outlook Classic drag operations.
+			// Try to parse the occurrence date from the drag text that Outlook Classic
+			// puts in the DataTransfer. Only trust it when the parsed date is DIFFERENT
+			// from the series start — for Google Calendar recurring events, Outlook copies
+			// the series-master text for every occurrence, so the drag text always carries
+			// the series start date and gives us no new information.
 			const parsedDate = dragText ? this.parseDateFromDragText(dragText) : null;
-			if (parsedDate) {
-				corrected = withDate(parsedDate);
+			const parsedIsUseful = parsedDate
+				&& parsedDate.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD');
+			if (parsedIsUseful) {
+				corrected = withDate(parsedDate!);
 			} else {
 				// Could not extract the date automatically — show a date-picker dialog.
 				// Pre-fill with the series start date in local time as a reasonable hint.
