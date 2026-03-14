@@ -1,11 +1,11 @@
-import { App, displayTooltip, Modal, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
+import { App, ButtonComponent, Modal, TextComponent, displayTooltip, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, EventRef, normalizePath } from 'obsidian';
 import MsgReader from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
 import moment from 'moment';
 
 const OutlookMeetingNotesDefaultFilenamePattern =
-	'{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm-ss{{/helper_dateFormat}} {{subject}}';
+	'{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD HH.mm{{/helper_dateFormat}} {{subject}}';
 
 const OutlookMeetingNotesDefaultTemplate = `---
 title: {{subject}}
@@ -38,76 +38,83 @@ const DEFAULT_SETTINGS: OutlookMeetingNotesSettings = {
 export default class OutlookMeetingNotes extends Plugin {
 	settings: OutlookMeetingNotesSettings;
 
-	// dragText: the plain-text representation of the appointment from the DataTransfer.
-	// Outlook Classic puts it there when dragging from the calendar; it contains the
-	// occurrence's actual "Start:" date, which lets us skip the manual-date dialog.
-	async createMeetingNote(msg: MsgReader, dragText = '') {
+	//TODO: Add functionality to export meeting notes nicely
+
+	async createMeetingNote(msg: MsgReader) {
 		try {
+			const { vault } = this.app;
+
+			// Get the file data from MsgReader
 			const origFileData = msg.getFileData();
+
+			// Check if we got a suitable meeting
 			if (origFileData.dataType != 'msg') {
-				throw new TypeError('Outlook Event Notes cannot process the file. '
+				throw new TypeError('Outlook Meeting Notes cannot process the file. '
 					+ 'MsgReader did not parse the file as valid msg format.');
 			} else if (origFileData.messageClass != 'IPM.Appointment') {
-				throw new TypeError('Outlook Event Notes cannot process the file. '
+				throw new TypeError('Outlook Meeting Notes cannot process the file. '
 					+ 'It is a valid msg file but not an appointment or meeting.');
 			}
-			await this.createNoteFromFileData(origFileData as any, dragText);
+
+			this.addHelperFunctions(origFileData);
+
+			// Add helper field for the current date and time
+			let fileData = origFileData as any;
+			fileData.helper_currentDT = moment().format();
+
+			this.ensureBodyField(fileData);
+			this.ensureDefaultFields(fileData);
+
+			if (this.isRecurringAppointment(fileData)) {
+				const occurrenceDate = await this.getRecurringOccurrenceDate();
+				if (occurrenceDate === null) {
+					new Notice('Meeting note creation cancelled.');
+					return;
+				}
+				this.applyRecurringOccurrenceDate(fileData, occurrenceDate);
+			}
+
+			let targetFolderPath = (this.settings.notesFolder ?? '').trim();
+			if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
+			else { targetFolderPath = normalizePath(targetFolderPath); }
+			const fileNameEscape = {
+				escape: (str: string): string => {
+					return str.replaceAll('/', this.settings.invalidFilenameCharReplacement);
+				}
+			}
+			const fileNameMustache = Mustache.render(
+				this.settings.fileNamePattern,
+				proxyData(fileData),
+				undefined,
+				fileNameEscape)
+				.replaceAll(/[*\"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
+			const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
+			const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
+			let meetingNoteFile = vault.getFileByPath(filePath);
+			if (meetingNoteFile) {
+				// File already exists
+				new Notice(meetingNoteFile.basename + ' already exists: opening it');
+			}
+			else {
+				if (targetFolderPath !== '' && vault.getFolderByPath(targetFolderPath) == null) {
+					await vault.createFolder(targetFolderPath);
+				}
+				const mustacheOutput = this.renderTemplate(
+					this.settings.notesTemplate,
+					fileData);
+				meetingNoteFile = await vault.create(filePath, mustacheOutput);
+				new Notice('New file created: ' + meetingNoteFile.basename);
+			}
+			const openInNewTab = false;
+			this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
+			// @ts-ignore: Property 'internalPlugins' does not exist on type 'App'.
+			const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
+			if (fe) { fe.revealInFolder(meetingNoteFile); }
 		} catch (ee: unknown) {
+			// TODO: Handle errors reasonably -- differently between msg missing elements and errors creating file
 			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
 		}
-	}
-
-	// Shared note-creation logic used by both the .msg path and the .ics path.
-	// fileData must have: subject, apptStartWhole, apptEndWhole, apptLocation,
-	// body/bodyText/bodyHtml, recipients[], apptRecur (null = skip date correction).
-	private async createNoteFromFileData(origFileData: any, dragText = ''): Promise<void> {
-		const { vault } = this.app;
-
-		this.addHelperFunctions(origFileData);
-		let fileData = origFileData;
-		fileData.helper_currentDT = moment().format();
-
-		this.ensureBodyField(fileData);
-
-		// For recurring .msg events, apptStartWhole may carry only the series start date.
-		// correctRecurringOccurrenceDate fixes it (using drag text, GlobalObjectId, or dialog).
-		// For .ics files apptRecur is null, so this returns true immediately.
-		const dateOk = await this.correctRecurringOccurrenceDate(fileData, dragText);
-		if (!dateOk) return; // user cancelled the date dialog
-
-		let targetFolderPath = (this.settings.notesFolder ?? '').trim();
-		if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
-		else { targetFolderPath = normalizePath(targetFolderPath); }
-		const fileNameEscape = {
-			escape: (str: string): string => {
-				return str.replaceAll('/', this.settings.invalidFilenameCharReplacement);
-			}
-		}
-		const fileNameMustache = Mustache.render(
-			this.settings.fileNamePattern,
-			proxyData(fileData),
-			undefined,
-			fileNameEscape)
-			.replaceAll(/[*\"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
-		const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
-		const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
-		let meetingNoteFile = vault.getFileByPath(filePath);
-		if (meetingNoteFile) {
-			new Notice(meetingNoteFile.basename + ' already exists: opening it');
-		} else {
-			if (targetFolderPath !== '' && vault.getFolderByPath(targetFolderPath) == null) {
-				await vault.createFolder(targetFolderPath);
-			}
-			const mustacheOutput = this.renderTemplate(this.settings.notesTemplate, fileData);
-			meetingNoteFile = await vault.create(filePath, mustacheOutput);
-			new Notice('New file created: ' + meetingNoteFile.basename);
-		}
-		const openInNewTab = false;
-		this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
-		// @ts-ignore: Property 'internalPlugins' does not exist on type 'App'.
-		const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
-		if (fe) { fe.revealInFolder(meetingNoteFile); }
 	}
 
 	private ensureBodyField(fileData: any): void {
@@ -117,7 +124,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			fileData.bodyText,
 			fileData.bodyPlainText,
 			fileData.bodyHtml,
-			fileData.rtfCompressed
+			fileData.rtfCompressed 
 		];
 		for (const candidate of fallbacks) {
 			if (typeof candidate === 'string' && candidate.trim() !== '') {
@@ -126,6 +133,14 @@ export default class OutlookMeetingNotes extends Plugin {
 			}
 		}
 		fileData.body = '';
+	}
+
+	private ensureDefaultFields(fileData: any): void {
+		const stringDefaults = ['subject', 'apptLocation', 'apptStartWhole', 'apptEndWhole'];
+		for (const field of stringDefaults) {
+			if (fileData[field] == null) { fileData[field] = ''; }
+		}
+		if (!Array.isArray(fileData.recipients)) { fileData.recipients = []; }
 	}
 
 	private dropHtmlTags(input: string): string {
@@ -142,60 +157,187 @@ export default class OutlookMeetingNotes extends Plugin {
 			.trim();
 	}
 
-	// Handle a file being dropped onto the ribbon icon.
-	// Accepts both Outlook .msg files and iCalendar .ics files.
-	// Drag a meeting directly from the Outlook Calendar view to get an .ics file
-	// whose DTSTART is always the exact occurrence date (no dialog needed).
+
+	private isRecurringAppointment(fileData: any): boolean {
+		const keys = Object.keys(fileData ?? {});
+		const boolClues = new Set(['isrecurring', 'isrecurringmeeting', 'recurring']);
+		for (const key of keys) {
+			const lower = key.toLowerCase();
+			if (boolClues.has(lower)) {
+				if ((fileData as Record<string, unknown>)[key] === true) {
+					return true;
+				}
+			}
+		}
+		const hintSubstrings = ['apptrecur', 'appointmentrecur', 'recurrence', 'recurrencerule', 'recurrencepattern', 'recurrenceinfo', 'recurrencestate', 'recurrencetype', 'recurringmaster', 'apptimezonedefrecur'];
+		for (const key of keys) {
+			const lower = key.toLowerCase();
+			for (const hint of hintSubstrings) {
+				if (lower.includes(hint)) {
+					const value = (fileData as Record<string, unknown>)[key];
+					if (typeof value === 'boolean') { return value; }
+					if (value != null && value !== '') { return true; }
+				}
+			}
+		}
+		if (typeof fileData.messageClass === 'string') {
+			const lowerClass = fileData.messageClass.toLowerCase();
+			if (lowerClass.includes('recurring') || lowerClass.includes('exception') || lowerClass.includes('occurrence')) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private async getRecurringOccurrenceDate(): Promise<string | null> {
+		let currentValue = moment().format('YYYY-MM-DD');
+		while (true) {
+			const result = await this.promptForRecurringDate(currentValue);
+			if (result === null) {
+				return null;
+			}
+			const trimmed = result.trim();
+			if (moment(trimmed, 'YYYY-MM-DD', true).isValid()) {
+				return trimmed;
+			}
+			new Notice('Please enter the date in YYYY-MM-DD format.');
+			if (trimmed !== '') { currentValue = trimmed; }
+		}
+	}
+
+	private async promptForRecurringDate(defaultValue: string): Promise<string | null> {
+		return await new Promise((resolve) => {
+			const modal = new RecurringOccurrenceModal(this.app, defaultValue, resolve);
+			modal.open();
+		});
+	}
+
+	private applyRecurringOccurrenceDate(fileData: any, occurrenceDate: string): void {
+		fileData.helper_selectedOccurrenceDate = occurrenceDate;
+		const selectedDate = moment(occurrenceDate, 'YYYY-MM-DD', true);
+		if (!selectedDate.isValid()) { return; }
+
+		const originalStart = moment(fileData.apptStartWhole);
+		const originalEnd = moment(fileData.apptEndWhole);
+		const originalStartLocal = moment(fileData.apptStartWholeLocal);
+		const originalEndLocal = moment(fileData.apptEndWholeLocal);
+
+		const durationMs = originalStart.isValid() && originalEnd.isValid()
+			? originalEnd.diff(originalStart)
+			: (originalStartLocal.isValid() && originalEndLocal.isValid()
+				? originalEndLocal.diff(originalStartLocal)
+				: null);
+
+		let adjustedStart = originalStart.isValid()
+			? originalStart.clone()
+			: (originalStartLocal.isValid()
+				? originalStartLocal.clone()
+				: selectedDate.clone().startOf('day'));
+		adjustedStart = adjustedStart
+			.year(selectedDate.year())
+			.month(selectedDate.month())
+			.date(selectedDate.date());
+		fileData.apptStartWhole = adjustedStart.format();
+
+		let adjustedEnd: moment.Moment | null = null;
+		if (originalEnd.isValid()) {
+			adjustedEnd = originalEnd.clone()
+				.year(selectedDate.year())
+				.month(selectedDate.month())
+				.date(selectedDate.date());
+		} else if (durationMs !== null) {
+			adjustedEnd = adjustedStart.clone().add(durationMs);
+		}
+		if (adjustedEnd) {
+			fileData.apptEndWhole = adjustedEnd.format();
+		}
+
+		if (originalStartLocal.isValid()) {
+			const adjustedStartLocal = originalStartLocal.clone()
+				.year(selectedDate.year())
+				.month(selectedDate.month())
+				.date(selectedDate.date());
+			fileData.apptStartWholeLocal = adjustedStartLocal.format();
+		} else {
+			fileData.apptStartWholeLocal = adjustedStart.format();
+		}
+
+		if (originalEndLocal.isValid()) {
+			let adjustedEndLocal = originalEndLocal.clone()
+				.year(selectedDate.year())
+				.month(selectedDate.month())
+				.date(selectedDate.date());
+			if (durationMs !== null && originalStartLocal.isValid()) {
+				const startLocalAdjusted = originalStartLocal.clone()
+					.year(selectedDate.year())
+					.month(selectedDate.month())
+					.date(selectedDate.date());
+				adjustedEndLocal = startLocalAdjusted.add(durationMs);
+			} else if (durationMs !== null) {
+				adjustedEndLocal = adjustedStart.clone().add(durationMs);
+			}
+			fileData.apptEndWholeLocal = adjustedEndLocal.format();
+		} else if (durationMs !== null && adjustedEnd) {
+			fileData.apptEndWholeLocal = adjustedEnd.format();
+		}
+
+		if (adjustedStart.isValid()) {
+			fileData.helper_selectedOccurrenceDateTimeIso = adjustedStart.toISOString();
+		}
+
+		const adjustedStartMoment = moment(fileData.apptStartWhole);
+		if (adjustedStartMoment.isValid()) {
+			for (const key of Object.keys(fileData)) {
+				if (!(typeof fileData[key] === 'string')) { continue; }
+				const lowerKey = key.toLowerCase();
+				if (lowerKey.startsWith('apptstart') && lowerKey.includes('date')) {
+					fileData[key] = adjustedStartMoment.format('YYYY-MM-DD');
+				} else if (lowerKey.startsWith('apptstart') && lowerKey.includes('time')) {
+					fileData[key] = adjustedStartMoment.format('HH:mm');
+				} else if (lowerKey.startsWith('apptstart') && lowerKey.includes('text')) {
+					fileData[key] = adjustedStartMoment.format('L LT');
+				}
+			}
+		}
+
+		if (typeof fileData.apptEndText === 'string' && fileData.apptEndWhole) {
+			const adjustedEndMoment = moment(fileData.apptEndWhole);
+			if (adjustedEndMoment.isValid()) {
+				fileData.apptEndText = adjustedEndMoment.format('L LT');
+			}
+		}
+	}
+
+	// Custom funciton to handle a file being dropped onto the ribbon icon.
 	async handleDropEvent(dropevt: DragEvent) {
 		if (dropevt.dataTransfer == null) {
-			throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The event had a null '
+			throw new ReferenceError('Outlook Meeting Notes cannot handle the DragEvent. The event had a null '
 				+ 'dataTransfer property, which should never happen when dispatched by the browser, according '
 				+ 'to https://developer.mozilla.org/en-US/docs/Web/API/DragEvent/dataTransfer');
 		} else {
-			const droppedFiles = dropevt.dataTransfer.files;
+			const droppedFiles = dropevt.dataTransfer.files
 			if (droppedFiles.length != 1) {
-				new Notice('Outlook Event Notes can only handle one meeting being dropped onto the ribbon icon');
-			} else {
+				new Notice('Outlook Meeting Notes can only handle one meeting being dropped onto the ribbon icon');
+			}
+			else {
+				// One file was dropped, hand it over to createMeetingNote
 				const droppedFile = droppedFiles[0];
-				const isIcs = droppedFile.name.toLowerCase().endsWith('.ics')
-					|| droppedFile.type === 'text/calendar';
 
-				if (isIcs) {
-					// iCalendar file: read as text and parse.
-					// DTSTART is always the correct occurrence date → no dialog needed.
-					const fr = new FileReader();
-					fr.onload = async () => {
-						try {
-							const fileData = this.parseIcsFile(fr.result as string);
-							await this.createNoteFromFileData(fileData);
-						} catch (ee: unknown) {
-							if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
-						}
-					};
-					fr.readAsText(droppedFile, 'utf-8');
-				} else {
-					// Outlook .msg binary file.
-					// Read the plain-text representation NOW (before the async FileReader),
-					// while dataTransfer is still accessible. Outlook Classic puts the
-					// appointment text here when dragging from the calendar view, including
-					// the occurrence's actual "Start:" / "Début :" date.
-					const dragText = dropevt.dataTransfer?.getData('text/plain') ?? '';
-
-					const fr = new FileReader();
-					fr.onload = async () => {
-						if (fr.result == null) {
-							throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
-								+ 'a null result property, which should not be possible.');
-						} else if (!(fr.result instanceof ArrayBuffer)) {
-							throw new TypeError('Outlook Event Notes cannot handle the DragEvent. The FileReader result '
-								+ 'property was not an ArrayBuffer, which should be impossible.');
-						} else {
-							const msgRdr = new MsgReader(fr.result);
-							await this.createMeetingNote(msgRdr, dragText);
-						}
-					};
-					fr.readAsArrayBuffer(droppedFile);
+				const fr = new FileReader();
+				fr.onload = () => {
+					if (fr.result == null) {
+						throw new ReferenceError('Outlook Meeting Notes cannot handle the DragEvent. The FileReader had '
+							+ 'a null result property, which should not be possible.');
+					} else if (!(fr.result instanceof ArrayBuffer)) {
+						throw new TypeError('Outlook Meeting Notes cannot handle the DragEvent. The FileReader result '
+							+ 'property was not an ArrayBuffer, which should be impossible.');
+					} else {
+						// As readAsArrayBuffer is being used, below, fr.result will be an ArrayBuffer.
+						const msgRdr = new MsgReader(fr.result);
+						this.createMeetingNote(msgRdr);
+					}
 				}
+				fr.readAsArrayBuffer(droppedFile)
 			}
 		}
 	}
@@ -205,12 +347,17 @@ export default class OutlookMeetingNotes extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		const tooltipMessage = 'Outlook Event Notes: Drag and drop a meeting onto this icon from Outlook (or a .msg file) to create a meeting note.';
+		const tooltipMessage = 'Outlook Meeting Notes: Drag and drop a meeting onto this icon from Outlook (or a .msg file) to create a meeting note.';
 
+		// This creates an icon in the left ribbon.
+		// Create an icon that does nothing when clicked, as the effect is from 
 		this.ribbonIconEl = this.addRibbonIcon('calendar-clock', tooltipMessage, () => { });
 
+		// These respond to something being dragged over the ribbon icon and dropped onto it
 		this.ribbonIconEl.addEventListener('dragenter', () => {
+			// Style for is-being-dragged-over is defined in the CSS file.
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', true);
+			// Display a tooltip.
 			const ttPosition = this.ribbonIconEl.getAttribute('data-tooltip-position') as TooltipPlacement;
 			const ttDelay = this.ribbonIconEl.getAttribute('data-tooltip-delay');
 			if (ttPosition != null && ttDelay != null) {
@@ -221,24 +368,44 @@ export default class OutlookMeetingNotes extends Plugin {
 		});
 		this.ribbonIconEl.addEventListener('dragleave', () => {
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
+			// Remove the tooltip when the user leaves the ribbon icon while still dragging.
 			const tooltip = document.getElementsByClassName('tooltip')[0]
 			if (tooltip) { tooltip.remove(); }
 		});
 		this.ribbonIconEl.addEventListener('dragover', (dragevt) => {
+			// User is dragging something over the icon
+
+			// Prevent the default behaviour of not allowing the drop event
 			dragevt.preventDefault();
+			// The dropEffect changes the cursor. Options are 'none', 'move', 'copy', and 'link'.
 			if (dragevt.dataTransfer != null) { dragevt.dataTransfer.dropEffect = 'copy'; }
 		});
 		this.ribbonIconEl.addEventListener('drop', (dropevt) => {
+			// User has dropped something on the icon
+
+			// If the user drops something, dragleave doesn't get called.
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
+
+			// Prevent the default behaviour because we're handling it.
 			dropevt.preventDefault();
+			// Call the custom function defined above.
 			this.handleDropEvent(dropevt);
 		});
-		this.ribbonIconEl.addClass('outlook-event-notes-icon');
+		this.ribbonIconEl.addClass('outlook-meeting-notes-icon');
 
+		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
+		// const statusBarItemEl = this.addStatusBarItem();
+		// statusBarItemEl.setText('Status Bar Text');
+
+		//TODO: Add commands to create meeting notes.
+
+		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new OutlookMeetingNotesSettingTab(this.app, this));
 	}
 
-	onunload() { }
+	onunload() {
+		//Don't need to remove event listeners because the icon will be gone.
+	}
 
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
@@ -258,8 +425,16 @@ export default class OutlookMeetingNotes extends Plugin {
 			dateFormat: () => {
 				return function (datetime_format: string, render: any) {
 					const parts = datetime_format.split('|');
-					const rawValue = render(parts[0]).trim();
-					const formattedMoment = moment(rawValue);
+					const rawValue = render(parts[0]).trim().replace(/^"|"$/g, '');
+					let formattedMoment = moment(rawValue);
+					if (!formattedMoment.isValid()) {
+						const ctx = this as Record<string, unknown> & { helper_selectedOccurrenceDateTimeIso?: string; helper_selectedOccurrenceDate?: string; };
+						const isoFallback = typeof ctx.helper_selectedOccurrenceDateTimeIso === 'string' ? ctx.helper_selectedOccurrenceDateTimeIso : undefined;
+						if (isoFallback) { formattedMoment = moment(isoFallback); }
+						if (!formattedMoment.isValid() && typeof ctx.helper_selectedOccurrenceDate === 'string') {
+							formattedMoment = moment(ctx.helper_selectedOccurrenceDate, 'YYYY-MM-DD', true);
+						}
+					}
 					if (!formattedMoment.isValid()) { return rawValue; }
 					return formattedMoment.format(parts[1]);
 				}
@@ -269,7 +444,8 @@ export default class OutlookMeetingNotes extends Plugin {
 		for (func in helperFunctions) {
 			hash['helper_' + func] = helperFunctions[func];
 		}
-		// Add helper functions to array items so they work inside mustache sections
+		// Add helper functions to all objects in arrays so that the helper 
+		// functions work inside mustache sections
 		for (let property in hash) {
 			if (hash[property] instanceof Array) {
 				for (let subproperty in hash[property]) {
@@ -285,10 +461,17 @@ export default class OutlookMeetingNotes extends Plugin {
 		return hash;
 	}
 
+	//////////////////////
+	// renderTemplate() //
+	//////////////////////
 	// Parse template into YAML and markdown sections to use different escaping for each
 	renderTemplate(template: string, hash: any): string {
-		// Matches '---' frontmatter block at the start of the string
+		// Regex /^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s matches '---' at the start of the string,
+		// then a platform-independent new-line, followed by a non-greedy match (because of *?) of any
+		// character including newlines (because of /s at end), followed by another --- on its own line
+		// with either another platform-independent new-line afterwards or the end of the string.
 		const templateYAMLMatch = template.match(/^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s);
+		// If there was a match, then make notesTemplateMD everything after it, otherwise it's the whole thing.
 		const templateMD = templateYAMLMatch ? template.substring(templateYAMLMatch[0].length) : template;
 
 		let output = ''
@@ -297,6 +480,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			const sanitizeYamlValue = (value: string): string => value.replace(/[><*]/g, '');
 			const mustacheYAMLOptions = {
 				escape: (str: string): string => {
+					// Escape YAML
 					const sanitized = sanitizeYamlValue(str);
 					const found = sanitized.match(/\r\n?|\n/);
 					if (found) {
@@ -335,374 +519,74 @@ export default class OutlookMeetingNotes extends Plugin {
 		return output;
 	}
 
-
-	// Parse an iCalendar (.ics) file and return a fileData object compatible with
-	// createNoteFromFileData. DTSTART in .ics files is always the correct occurrence
-	// date (Outlook sets it to the specific occurrence when dragging from calendar view),
-	// so apptRecur is set to null to skip the recurring-event correction dialog.
-	private parseIcsFile(content: string): any {
-		// RFC 5545 §3.1: unfold continuation lines (lines starting with whitespace)
-		const text = content
-			.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-			.replace(/\n[ \t]/g, '');
-
-		// Find first VEVENT block
-		const m = text.match(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/i);
-		if (!m) throw new TypeError('The .ics file does not contain a VEVENT block.');
-		const block = m[1];
-
-		// Parse all property lines: NAME or NAME;PARAM=VAL:value
-		const propMap = new Map<string, Array<{ value: string; params: Record<string, string> }>>();
-		for (const line of block.split('\n')) {
-			const colon = line.indexOf(':');
-			if (colon === -1) continue;
-			const keyFull = line.slice(0, colon);
-			const value = line.slice(colon + 1).trimEnd();
-			const semi = keyFull.indexOf(';');
-			const name = (semi === -1 ? keyFull : keyFull.slice(0, semi)).toUpperCase();
-			const paramStr = semi === -1 ? '' : keyFull.slice(semi + 1);
-			const params: Record<string, string> = {};
-			for (const seg of paramStr.split(';').filter(Boolean)) {
-				const eq = seg.indexOf('=');
-				if (eq !== -1) {
-					params[seg.slice(0, eq).toUpperCase()] =
-						seg.slice(eq + 1).replace(/^"(.*)"$/, '$1');
-				}
-			}
-			if (!propMap.has(name)) propMap.set(name, []);
-			propMap.get(name)!.push({ value, params });
-		}
-
-		const get = (name: string) => propMap.get(name)?.[0];
-
-		// Unescape RFC 5545 text values
-		const unescape = (s: string) =>
-			s.replace(/\\n/gi, '\n').replace(/\\,/g, ',')
-				.replace(/\\;/g, ';').replace(/\\\\/g, '\\');
-
-		// Parse a date/time property to a moment.
-		// UTC times end with Z; TZID times are parsed as local (assumes the
-		// computer's timezone matches the event's timezone, which is the common case).
-		const parseDT = (prop: { value: string; params: Record<string, string> } | undefined)
-			: moment.Moment | undefined => {
-			if (!prop) return undefined;
-			const v = prop.value.replace(/\s/g, '');
-			if (v.endsWith('Z')) {
-				const clean = v.slice(0, -1);
-				return moment.utc(clean, clean.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
-			}
-			return moment(v, v.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
-		};
-
-		// Parse attendees (ATTENDEE;CN=...:mailto:email)
-		const recipients: Array<{ name: string; email: string }> = [];
-		for (const att of propMap.get('ATTENDEE') ?? []) {
-			const emailM = att.value.match(/mailto:(.+)/i);
-			if (!emailM) continue;
-			const email = emailM[1].trim();
-			const cn = att.params['CN'];
-			recipients.push({ name: cn ? unescape(cn) : email, email });
-		}
-
-		const summaryProp = get('SUMMARY');
-		const dtstart = get('DTSTART');
-		const dtend = get('DTEND');
-		const locationProp = get('LOCATION');
-		const descProp = get('DESCRIPTION');
-
-		if (!summaryProp) throw new TypeError('The .ics file is missing a SUMMARY (event title).');
-		if (!dtstart) throw new TypeError('The .ics file is missing a DTSTART (start date).');
-
-		return {
-			dataType: 'msg',                  // satisfies createMeetingNote validation path
-			messageClass: 'IPM.Appointment',
-			subject: unescape(summaryProp.value),
-			apptStartWhole: parseDT(dtstart)?.toISOString(),
-			apptEndWhole: parseDT(dtend)?.toISOString(),
-			apptLocation: locationProp ? unescape(locationProp.value) : '',
-			body: descProp ? unescape(descProp.value) : '',
-			recipients,
-			apptRecur: null,  // DTSTART already has the correct occurrence date
-		};
-	}
-
-	// Convert Outlook recurrence minutes (since midnight Jan 1, 1601, local time) to a moment.
-	private dateFromRecurMinutes(minutes: number): moment.Moment {
-		return moment(new Date(-11644473600000 + minutes * 60000));
-	}
-
-	// For recurring events, apptStartWhole stores the first occurrence's date.
-	// When a later occurrence is dragged, we try to correct it using:
-	//   1. PidLidGlobalObjectId bytes 16-19, which Outlook sets to the specific
-	//      occurrence's year/month/day (zeros = series master / non-specific).
-	//   2. If still unknown, show a date-picker dialog pre-filled with the
-	//      occurrence from the recurrence pattern closest to today.
-	// Returns false if the user cancelled the dialog (caller should abort note creation).
-	private async correctRecurringOccurrenceDate(fileData: any, dragText = ''): Promise<boolean> {
-		const apptRecur = fileData.apptRecur;
-		if (!apptRecur?.recurrencePattern) return true;
-
-		const rp = apptRecur.recurrencePattern;
-		const apptStart = moment(fileData.apptStartWhole);
-		if (!apptStart.isValid()) return true;
-
-		// Early-exit: if apptStartWhole is already on a different local calendar day
-		// than the series start, Outlook stored the correct occurrence — leave it alone.
-		//
-		// Key invariant: dateFromRecurMinutes(startDate) always produces a moment
-		// whose UTC date equals the series-start LOCAL calendar date (midnight-local
-		// is encoded as an offset from midnight-UTC-1601, so the UTC date = local date).
-		// Therefore: compare apptStart.local() (the event's local date) with
-		// firstOccDate.utc() (which carries the series-start calendar date).
-		//
-		// The old ">= 24 h diff" check broke for UTC−4/UTC−5 evening events: an event
-		// at 21:30 EDT stores apptStartWhole as ~01:30 UTC the next day, making the
-		// diff ≥ 24 h even though both represent the same local calendar day.
-		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
-		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD')) return true;
-
-		let corrected: moment.Moment | null = null;
-
-		// Helper: given a chosen local date, produce the corrected occurrence moment.
-		// We preserve the original time-of-day from apptStartWhole (in local timezone)
-		// and only swap the calendar date, so the resulting UTC value is correct
-		// regardless of whether the event was created in a different timezone.
-		const withDate = (d: moment.Moment): moment.Moment =>
-			apptStart.clone().year(d.year()).month(d.month()).date(d.date());
-
-		// Try PidLidGlobalObjectId first — most reliable source for native Outlook events.
-		const occDateFromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
-		if (occDateFromId) {
-			corrected = withDate(occDateFromId);
-		} else {
-			// Try to parse the occurrence date from the drag text that Outlook Classic
-			// puts in the DataTransfer. Only trust it when the parsed date is DIFFERENT
-			// from the series start — for Google Calendar recurring events, Outlook copies
-			// the series-master text for every occurrence, so the drag text always carries
-			// the series start date and gives us no new information.
-			const parsedDate = dragText ? this.parseDateFromDragText(dragText) : null;
-			const parsedIsUseful = parsedDate
-				&& parsedDate.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD');
-			if (parsedIsUseful) {
-				corrected = withDate(parsedDate!);
-			} else {
-				// Could not extract the date automatically — show a date-picker dialog.
-				// Pre-fill with the occurrence nearest to today (rather than the series
-				// start) because users typically drag an upcoming or recent meeting.
-				// For a yearly event in March 2026, this correctly lands on 2026-07-26
-				// instead of the series-start 2021-07-26 that would otherwise appear.
-				// Falls back to the series start if the recurrence type is unrecognised.
-				const closestOcc = this.findClosestOccurrence(apptRecur, apptStart, moment());
-				const suggestedStr = closestOcc
-					? closestOcc.local().format('YYYY-MM-DD')
-					: apptStart.local().format('YYYY-MM-DD');
-
-				const userDateStr = await new Promise<string | null>((resolve) => {
-					new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
-				});
-
-				if (!userDateStr) return false; // user cancelled
-
-				const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
-				if (!userDate.isValid()) return false;
-				corrected = withDate(userDate);
-			}
-		}
-
-		if (!corrected) return true;
-
-		const endStart = moment(fileData.apptEndWhole);
-		if (endStart.isValid()) {
-			const duration = endStart.diff(apptStart, 'minutes');
-			fileData.apptEndWhole = corrected.clone().add(duration, 'minutes').toISOString();
-		}
-		fileData.apptStartWhole = corrected.toISOString();
-		return true;
-	}
-
-	// Parse the occurrence date from PidLidGlobalObjectId (as hex string).
-	// Bytes 16-17 = year (big-endian), 18 = month, 19 = day.
-	// Returns null when the bytes are all zero (series master, not occurrence-specific).
-	private getOccurrenceDateFromGlobalId(hexStr: string | undefined): moment.Moment | null {
-		if (!hexStr || hexStr.length < 40) return null;
-		const year = (parseInt(hexStr.substring(32, 34), 16) << 8) | parseInt(hexStr.substring(34, 36), 16);
-		const month = parseInt(hexStr.substring(36, 38), 16);
-		const day = parseInt(hexStr.substring(38, 40), 16);
-		if (year === 0 || month === 0 || day === 0) return null;
-		return moment({ year, month: month - 1, day }); // month is 0-indexed in moment
-	}
-
-	// Try to extract the occurrence start date from the plain-text representation
-	// that Outlook Classic puts in the DataTransfer when the user drags a calendar
-	// event. The text contains a line like:
-	//   English: "Start:   Wednesday, October 15, 2025 9:30 PM"
-	//   French:  "Début :  mercredi 15 octobre 2025 21:30"
-	// Returns null if no parseable date is found (caller should fall back to dialog).
-	private parseDateFromDragText(text: string): moment.Moment | null {
-		// Locate the Start / Début line. Handles:
-		//   • space before colon  ("Début :")
-		//   • tab between colon and value
-		//   • all keyword variants (Start / Début / Debut / Begin)
-		const lineMatch = text.match(/^(?:start|d[eé]but|begin)\s*:\s*(.+)$/im);
-		if (!lineMatch) return null;
-		const rawDate = lineMatch[1].trim();
-		if (!rawDate) return null;
-
-		// locale → strict-mode formats to attempt
-		const localeFormats: Array<[string, string[]]> = [
-			['fr', [
-				'dddd D MMMM YYYY HH:mm',	// mercredi 15 octobre 2025 21:30
-				'dddd D MMMM YYYY H:mm',
-				'dddd D MMMM YYYY',
-				'D/M/YYYY HH:mm',
-				'D/M/YYYY H:mm',
-			]],
-			['fr-ca', [
-				'dddd D MMMM YYYY HH:mm',
-				'dddd D MMMM YYYY H:mm',
-				'dddd D MMMM YYYY',
-			]],
-			['en', [
-				'dddd, MMMM D, YYYY h:mm A',	// Wednesday, October 15, 2025 9:30 PM
-				'dddd, MMMM D, YYYY HH:mm',
-				'dddd MMMM D, YYYY h:mm A',
-				'dddd MMMM D YYYY h:mm A',
-				'M/D/YYYY h:mm A',
-				'M/D/YYYY HH:mm',
-			]],
-		];
-
-		const savedLocale = moment.locale();
-		try {
-			for (const [locale, formats] of localeFormats) {
-				moment.locale(locale);
-				for (const fmt of formats) {
-					const m = moment(rawDate, fmt, locale, true);
-					if (m.isValid()) return m;
-				}
-			}
-			// Last resort: let moment parse without strict mode.
-			// Guard against garbage: require a plausible year range.
-			moment.locale(savedLocale);
-			const loose = moment(rawDate);
-			if (loose.isValid() && loose.year() >= 2000 && loose.year() <= 2100) return loose;
-		} finally {
-			moment.locale(savedLocale);
-		}
-		return null;
-	}
-
-	// Return the occurrence of a recurring series closest to `today`.
-	// baseTime is apptStartWhole as a moment — the first occurrence with the
-	// correct timezone. Using it as the anchor avoids the one-day-off error that
-	// arises when startDate (always midnight UTC) is converted to local time.
-	private findClosestOccurrence(apptRecur: any, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
-		try {
-			const rp = apptRecur.recurrencePattern;
-
-			// Local-time midnight of baseTime, used for day-level period arithmetic.
-			const firstMidnight = baseTime.clone().startOf('day');
-
-			const candidates: moment.Moment[] = [];
-			const freq: number = rp.recurFrequency;
-			const period: number = rp.period;
-
-			if (freq === 8202) { // Daily (period is in minutes)
-				const periodDays = Math.max(1, Math.round(period / 1440));
-				const n = Math.round(today.diff(firstMidnight, 'days') / periodDays);
-				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(baseTime.clone().add(i * periodDays, 'days'));
-			} else if (freq === 8203) { // Weekly (period is in weeks)
-				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << baseTime.day());
-				const firstWeekSun = firstMidnight.clone().startOf('week');
-				const n = Math.round(today.diff(firstWeekSun, 'weeks') / period);
-				for (let w = Math.max(0, n - 1); w <= n + 2; w++) {
-					const weekBase = firstWeekSun.clone().add(w * period, 'weeks');
-					for (let d = 0; d < 7; d++)
-						if (dayBits & (1 << d))
-							candidates.push(weekBase.clone().add(d, 'days')
-								.add(baseTime.hours() * 60 + baseTime.minutes(), 'minutes'));
-				}
-			} else if (freq === 8204) { // Monthly (period is in months)
-				const n = Math.round(Math.max(0, today.diff(firstMidnight, 'months')) / period);
-				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(baseTime.clone().add(i * period, 'months'));
-			} else if (freq === 8205) { // Yearly
-				const n = Math.max(0, today.diff(firstMidnight, 'years'));
-				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-					candidates.push(baseTime.clone().add(i, 'years'));
-			} else {
-				return null;
-			}
-
-			const valid = candidates.filter(c => !c.isBefore(baseTime, 'day'));
-			if (valid.length === 0) return baseTime;
-			return valid.reduce((best, c) =>
-				Math.abs(c.diff(today)) < Math.abs(best.diff(today)) ? c : best
-			);
-		} catch {
-			return null;
-		}
-	}
-
 }
 
-// Modal shown when the specific occurrence date cannot be determined from the .msg file.
-// The user can confirm or correct the pre-filled date before the note is created.
-class OccurrenceDateModal extends Modal {
-	private dateStr: string;
-	private readonly onSubmit: (date: string | null) => void;
-	private resolved = false;
+class RecurringOccurrenceModal extends Modal {
+	private readonly defaultDate: string;
+	private readonly resolvePromise: (value: string | null) => void;
+	private input!: TextComponent;
+	private hasResolved = false;
 
-	constructor(app: App, suggestedDate: string, onSubmit: (date: string | null) => void) {
+	constructor(app: App, defaultDate: string, resolve: (value: string | null) => void) {
 		super(app);
-		this.dateStr = suggestedDate;
-		this.onSubmit = onSubmit;
-	}
-
-	private resolve(date: string | null): void {
-		if (this.resolved) return;
-		this.resolved = true;
-		this.onSubmit(date);
+		this.defaultDate = defaultDate;
+		this.resolvePromise = resolve;
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
-		contentEl.createEl('h3', { text: 'Confirm occurrence date' });
-		contentEl.createEl('p', {
-			text: 'This is an occurrence of a recurrent event. '
-				+ 'It is not possible to read the date of an occurrence of a recurrent event. '
-				+ 'Every occurrence produces an identical file with only the series start date. '
-				+ 'The field below is pre-filled with the occurrence nearest to today. '
-				+ 'Confirm if that is the event you dragged, or correct it to match '
-				+ 'the date shown in your calendar.'
+		contentEl.empty();
+		contentEl.createEl('h2', { text: 'Recurring meeting' });
+		contentEl.createEl('p', { text: 'This event is recurring. Enter the occurrence date in YYYY-MM-DD format.' });
+
+		const inputWrapper = contentEl.createDiv({ cls: 'outlook-meeting-notes-recurring-date-input' });
+		this.input = new TextComponent(inputWrapper);
+		this.input.setPlaceholder('YYYY-MM-DD');
+		this.input.setValue(this.defaultDate);
+		this.input.inputEl.setAttribute('aria-label', 'Recurring meeting date');
+		this.input.inputEl.addEventListener('keydown', (evt) => {
+			if (evt.key === 'Enter') {
+				evt.preventDefault();
+				this.submit();
+			}
 		});
 
-		new Setting(contentEl)
-			.setName('Event date')
-			.addText(text => {
-				text.inputEl.type = 'text';
-				text.inputEl.placeholder = 'YYYY-MM-DD';
-				text.setValue(this.dateStr);
-				text.onChange(value => { this.dateStr = value; });
-				text.inputEl.addEventListener('keydown', (e) => {
-					if (e.key === 'Enter') { this.resolve(this.dateStr); this.close(); }
-				});
-			});
+		const buttonWrapper = contentEl.createDiv({ cls: 'outlook-meeting-notes-recurring-date-buttons' });
+		new ButtonComponent(buttonWrapper)
+			.setButtonText('Cancel')
+			.onClick(() => this.cancel());
+		new ButtonComponent(buttonWrapper)
+			.setButtonText('OK')
+			.setCta()
+			.onClick(() => this.submit());
 
-		new Setting(contentEl)
-			.addButton(btn => btn
-				.setButtonText('Create note')
-				.setCta()
-				.onClick(() => { this.resolve(this.dateStr); this.close(); }))
-			.addButton(btn => btn
-				.setButtonText('Cancel')
-				.onClick(() => { this.resolve(null); this.close(); }));
+		setTimeout(() => {
+			this.input.inputEl.focus({ preventScroll: true });
+			this.input.inputEl.select();
+		}, 0);
+	}
+
+	private submit(): void {
+		if (this.hasResolved) { return; }
+		this.hasResolved = true;
+		const value = this.input.getValue().trim();
+		this.resolvePromise(value);
+		this.close();
+	}
+
+	private cancel(): void {
+		if (this.hasResolved) { return; }
+		this.hasResolved = true;
+		this.resolvePromise(null);
+		this.close();
 	}
 
 	onClose(): void {
+		if (!this.hasResolved) {
+			this.hasResolved = true;
+			this.resolvePromise(null);
+		}
 		this.contentEl.empty();
-		this.resolve(null); // no-op if already resolved via a button
 	}
 }
 
@@ -774,7 +658,7 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 					'For more information about filename patterns and the syntax for templates, see the '
 				));
 				const link = document.createElement('a');
-				link.href = 'https://github.com/nathanstorm689/outlook-meeting-notes-plus#readme';
+				link.href = 'https://www.github.com/davidingerslev/outlook-meeting-notes/#outlook-meeting-notes';
 				link.target = '_blank';
 				link.rel = 'noopener';
 				link.textContent = 'documentation';
@@ -785,3 +669,27 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 
 	}
 }
+
+/*
+ * Notes from the sample plugin README.md
+
+## Releasing new releases
+
+- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
+- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
+- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
+- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
+- Publish the release.
+
+> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
+> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
+
+## Adding your plugin to the community plugin list
+
+- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
+- Publish an initial version.
+- Make sure you have a `README.md` file in the root of your repo.
+- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
+ */
+
+
