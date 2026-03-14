@@ -56,9 +56,9 @@ Produces filenames like `2026-03-11_19-00_00 Discuss documentation`.
 
 You can use `/` to create subfolders:
 ```
-{{#helper_dateFormat}}{{apptStartWhole}}|YYYY/MM MMMM/YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}} {{subject}}
+{{#helper_dateFormat}}{{apptStartWhole}}|YYYY/MM/YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}} {{subject}}
 ```
-produces `2026/03 March/2026-03-11_19-00_00 Discuss documentation`
+produces `2026/03/2026-03-11_19-00_00 Discuss documentation`
 
 ### Invalid character substitute
 Characters that are invalid in filenames (`/ * " \ < > : | ?`) are replaced with this value. Blank = remove them.
