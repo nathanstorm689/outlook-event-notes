@@ -1,6 +1,6 @@
 {
 	"name": "outlook-event-notes",
-	"version": "0.2.1",
+	"version": "0.3.0",
 	"description": "Create Obsidian notes from Outlook .msg files — supports meetings, appointments, and recurring events.",
 	"main": "main.js",
 	"scripts": {
@@ -8,7 +8,13 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
-	"keywords": ["obsidian", "outlook", "meeting", "notes", "msg"],
+	"keywords": [
+		"obsidian",
+		"outlook",
+		"meeting",
+		"notes",
+		"msg"
+	],
 	"author": "nathanstorm689",
 	"license": "ISC",
 	"repository": {
