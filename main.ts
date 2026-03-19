@@ -690,8 +690,7 @@ class OccurrenceDateModal extends Modal {
 		new Setting(contentEl)
 			.setName('Event date')
 			.addText(text => {
-				text.inputEl.type = 'text';
-				text.setPlaceholder('YYYY-MM-DD');
+				text.inputEl.type = 'date';
 				text.setValue(this.dateStr);
 				text.onChange(value => { this.dateStr = value; });
 				text.inputEl.addEventListener('keydown', (e) => {
