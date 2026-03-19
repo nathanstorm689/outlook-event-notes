@@ -50,15 +50,15 @@ The folder where new notes are created. Created automatically if it does not exi
 ### Filename pattern
 Uses Mustache syntax. Default:
 ```
-{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}} {{subject}}
+{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}}_{{subject}}
 ```
-Produces filenames like `2026-03-11_19-00_00 Discuss documentation`.
+Produces filenames like `2026-03-11_19-00_00_Discuss documentation`.
 
 You can use `/` to create subfolders:
 ```
 {{#helper_dateFormat}}{{apptStartWhole}}|YYYY/MM/YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}} {{subject}}
 ```
-produces `2026/03/2026-03-11_19-00_00 Discuss documentation`
+produces `2026/03/2026-03-11_19-00_00_Discuss documentation`
 
 ### Invalid character substitute
 Characters that are invalid in filenames (`/ * " \ < > : | ?`) are replaced with this value. Blank = remove them.

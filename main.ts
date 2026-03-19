@@ -5,7 +5,7 @@ import Mustache from 'mustache';
 import moment from 'moment';
 
 const OutlookMeetingNotesDefaultFilenamePattern =
-	'{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}} {{subject}}';
+	'{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}}_{{subject}}';
 
 const OutlookMeetingNotesDefaultTemplate = `---
 title: {{subject}}
