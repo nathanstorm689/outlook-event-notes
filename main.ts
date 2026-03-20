@@ -162,8 +162,10 @@ export default class OutlookMeetingNotes extends Plugin {
 				+ 'to https://developer.mozilla.org/en-US/docs/Web/API/DragEvent/dataTransfer');
 		} else {
 			const droppedFiles = dropevt.dataTransfer.files;
-			if (droppedFiles.length != 1) {
-				new Notice('Outlook Event Notes can only handle one meeting being dropped onto the ribbon icon');
+			if (droppedFiles.length === 0) {
+				new Notice('Outlook Event Notes: no file was received. The new Outlook app does not support drag-and-drop — please use Outlook Classic, or export the event as .ics and drop that instead.');
+			} else if (droppedFiles.length > 1) {
+				new Notice('Outlook Event Notes can only handle one meeting at a time.');
 			} else {
 				const droppedFile = droppedFiles[0];
 				const isIcs = droppedFile.name.toLowerCase().endsWith('.ics')
