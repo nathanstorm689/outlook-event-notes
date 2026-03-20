@@ -607,6 +607,8 @@ export default class OutlookMeetingNotes extends Plugin {
 	// baseTime is apptStartWhole as a moment — the first occurrence with the
 	// correct timezone. Using it as the anchor avoids the one-day-off error that
 	// arises when startDate (always midnight UTC) is converted to local time.
+	// Respects the series end date so past-ended or future series return the
+	// closest valid occurrence rather than falling back to the series start.
 	private findClosestOccurrence(apptRecur: any, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
 		try {
 			const rp = apptRecur.recurrencePattern;
@@ -614,19 +616,32 @@ export default class OutlookMeetingNotes extends Plugin {
 			// Local-time midnight of baseTime, used for day-level period arithmetic.
 			const firstMidnight = baseTime.clone().startOf('day');
 
+			// Determine the last valid occurrence date if the series has an end date.
+			// endDate is stored in the same minutes-since-1601 format as startDate.
+			// A value of 0x5AE980DF (1525252319) is Outlook's sentinel for "no end date".
+			const OUTLOOK_NO_END = 0x5AE980DF;
+			const lastOccDate: moment.Moment | null =
+				rp.endDate && rp.endDate !== OUTLOOK_NO_END
+					? this.dateFromRecurMinutes(rp.endDate)
+					: null;
+
 			const candidates: moment.Moment[] = [];
 			const freq: number = rp.recurFrequency;
 			const period: number = rp.period;
 
+			// For future series (baseTime > today), anchor candidate generation at
+			// baseTime so we always produce the first occurrence as a candidate.
+			const anchor = today.isBefore(firstMidnight) ? firstMidnight : today;
+
 			if (freq === 8202) { // Daily (period is in minutes)
 				const periodDays = Math.max(1, Math.round(period / 1440));
-				const n = Math.round(today.diff(firstMidnight, 'days') / periodDays);
+				const n = Math.round(anchor.diff(firstMidnight, 'days') / periodDays);
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
 					candidates.push(baseTime.clone().add(i * periodDays, 'days'));
 			} else if (freq === 8203) { // Weekly (period is in weeks)
 				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << baseTime.day());
 				const firstWeekSun = firstMidnight.clone().startOf('week');
-				const n = Math.round(today.diff(firstWeekSun, 'weeks') / period);
+				const n = Math.round(anchor.diff(firstWeekSun, 'weeks') / period);
 				for (let w = Math.max(0, n - 1); w <= n + 2; w++) {
 					const weekBase = firstWeekSun.clone().add(w * period, 'weeks');
 					for (let d = 0; d < 7; d++)
@@ -635,20 +650,30 @@ export default class OutlookMeetingNotes extends Plugin {
 								.add(baseTime.hours() * 60 + baseTime.minutes(), 'minutes'));
 				}
 			} else if (freq === 8204) { // Monthly (period is in months)
-				const n = Math.round(Math.max(0, today.diff(firstMidnight, 'months')) / period);
+				const n = Math.round(Math.max(0, anchor.diff(firstMidnight, 'months')) / period);
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
 					candidates.push(baseTime.clone().add(i * period, 'months'));
 			} else if (freq === 8205) { // Yearly
-				const n = Math.max(0, today.diff(firstMidnight, 'years'));
+				const n = Math.max(0, anchor.diff(firstMidnight, 'years'));
 				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
 					candidates.push(baseTime.clone().add(i, 'years'));
 			} else {
 				return null;
 			}
 
-			const valid = candidates.filter(c => !c.isBefore(baseTime, 'day'));
-			if (valid.length === 0) return baseTime;
-			return valid.reduce((best, c) =>
+			// Filter: must be on or after the series start, and on or before the end date.
+			const valid = candidates.filter(c =>
+				!c.isBefore(baseTime, 'day') &&
+				(lastOccDate === null || !c.isAfter(lastOccDate, 'day'))
+			);
+
+			// If no candidates survive (e.g. series ended before today), clamp to the
+			// last occurrence: pick the candidate closest to today that is still within range.
+			const pool = valid.length > 0 ? valid : candidates.filter(c =>
+				!c.isBefore(baseTime, 'day')
+			);
+			if (pool.length === 0) return baseTime;
+			return pool.reduce((best, c) =>
 				Math.abs(c.diff(today)) < Math.abs(best.diff(today)) ? c : best
 			);
 		} catch {
