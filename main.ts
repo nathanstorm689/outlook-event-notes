@@ -218,7 +218,7 @@ export default class OutlookMeetingNotes extends Plugin {
 
 		this.ribbonIconEl = this.addRibbonIcon('calendar-clock', tooltipMessage, () => { });
 
-		this.ribbonIconEl.addEventListener('dragenter', () => {
+		this.registerDomEvent(this.ribbonIconEl, 'dragenter', () => {
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', true);
 			const ttPosition = this.ribbonIconEl.getAttribute('data-tooltip-position') as TooltipPlacement;
 			const ttDelay = this.ribbonIconEl.getAttribute('data-tooltip-delay');
@@ -228,16 +228,16 @@ export default class OutlookMeetingNotes extends Plugin {
 				displayTooltip(this.ribbonIconEl, tooltipMessage);
 			}
 		});
-		this.ribbonIconEl.addEventListener('dragleave', () => {
+		this.registerDomEvent(this.ribbonIconEl, 'dragleave', () => {
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
-			const tooltip = document.getElementsByClassName('tooltip')[0]
+			const tooltip = document.getElementsByClassName('tooltip')[0];
 			if (tooltip) { tooltip.remove(); }
 		});
-		this.ribbonIconEl.addEventListener('dragover', (dragevt) => {
+		this.registerDomEvent(this.ribbonIconEl, 'dragover', (dragevt: DragEvent) => {
 			dragevt.preventDefault();
 			if (dragevt.dataTransfer != null) { dragevt.dataTransfer.dropEffect = 'copy'; }
 		});
-		this.ribbonIconEl.addEventListener('drop', (dropevt) => {
+		this.registerDomEvent(this.ribbonIconEl, 'drop', (dropevt: DragEvent) => {
 			this.ribbonIconEl.toggleClass('is-being-dragged-over', false);
 			dropevt.preventDefault();
 			this.handleDropEvent(dropevt);
@@ -782,14 +782,27 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 					'For more information about filename patterns and the syntax for templates, see the '
 				));
 				const link = document.createElement('a');
-				link.href = 'https://github.com/nathanstorm689/outlook-meeting-notes-plus#readme';
+				link.href = 'https://github.com/nathanstorm689/outlook-event-notes#readme';
 				link.target = '_blank';
 				link.rel = 'noopener';
 				link.textContent = 'documentation';
 				df.appendChild(link);
-				df.appendChild(document.createTextNode('.'))
+				df.appendChild(document.createTextNode('.'));
 				return df;
-			})())
+			})());
 
+		new Setting(containerEl)
+			.setDesc((() => {
+				const df = document.createDocumentFragment();
+				df.appendChild(document.createTextNode('If this plugin saves you time, consider '));
+				const link = document.createElement('a');
+				link.href = 'https://buymeacoffee.com/nathanstorm';
+				link.target = '_blank';
+				link.rel = 'noopener';
+				link.textContent = 'buying me a coffee';
+				df.appendChild(link);
+				df.appendChild(document.createTextNode(' ☕'));
+				return df;
+			})());
 	}
 }

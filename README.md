@@ -1,5 +1,7 @@
 # Outlook Event Notes
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-nathanstorm-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/nathanstorm)
+
 An [Obsidian](https://obsidian.md) plugin that creates notes from Microsoft Outlook meetings, appointments, and recurring events by dragging and dropping `.msg` files onto a ribbon icon.
 
 > **Based on [Outlook Meeting Notes](https://github.com/davidingerslev/outlook-meeting-notes) by [David Ingerslev](https://github.com/davidingerslev).**
