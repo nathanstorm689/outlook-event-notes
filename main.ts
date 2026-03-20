@@ -629,9 +629,13 @@ export default class OutlookMeetingNotes extends Plugin {
 			const freq: number = rp.recurFrequency;
 			const period: number = rp.period;
 
-			// For future series (baseTime > today), anchor candidate generation at
-			// baseTime so we always produce the first occurrence as a candidate.
-			const anchor = today.isBefore(firstMidnight) ? firstMidnight : today;
+			// Anchor for candidate generation:
+			// - Future series (baseTime > today): use series start so the first occurrence is always a candidate.
+			// - Past series (lastOccDate < today): use lastOccDate so candidates land inside the series range.
+			// - Normal: use today.
+			const anchor = today.isBefore(firstMidnight)
+				? firstMidnight
+				: (lastOccDate && today.isAfter(lastOccDate, 'day') ? lastOccDate : today);
 
 			if (freq === 8202) { // Daily (period is in minutes)
 				const periodDays = Math.max(1, Math.round(period / 1440));
