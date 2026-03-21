@@ -178,9 +178,10 @@ export default class OutlookMeetingNotes extends Plugin {
 		} else {
 			const droppedFiles = dropevt.dataTransfer.files;
 			if (droppedFiles.length === 0) {
-				new Notice('Outlook Event Notes: no file was received. The new Outlook app does not support drag-and-drop — please use Outlook Classic, or export the event as .ics and drop that instead.');
+				// eslint-disable-next-line obsidianmd/ui/sentence-case
+				new Notice('No file received. The new Outlook app does not support drag-and-drop — please use Outlook Classic, or export the event as .ics and drop that instead.');
 			} else if (droppedFiles.length > 1) {
-				new Notice('Outlook Event Notes can only handle one meeting at a time.');
+				new Notice('Only one meeting file can be dropped at a time.');
 			} else {
 				const droppedFile = droppedFiles[0];
 				const isIcs = droppedFile.name.toLowerCase().endsWith('.ics')
