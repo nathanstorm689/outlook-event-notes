@@ -1,8 +1,23 @@
-import { App, displayTooltip, Modal, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
-import MsgReader from '@kenjiuno/msgreader';
+import { App, displayTooltip, Modal, moment as _moment, Notice, Plugin, PluginSettingTab, Setting, TooltipPlacement, normalizePath } from 'obsidian';
+import MsgReader, { AppointmentRecur, FieldsData } from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
-import moment from 'moment';
+
+// moment is provided by Obsidian's bundle; importing from 'obsidian' satisfies the plugin review requirement.
+// The namespace-style re-export in obsidian.d.ts loses the callable signature, so we cast it here.
+const moment = _moment as unknown as typeof import('moment/moment');
+
+// MeetingFileData extends FieldsData with additional dynamic fields added at runtime.
+// recipients is widened to include plain {name, email} objects from .ics parsing.
+// apptRecur is widened to allow null (used by .ics path to skip occurrence correction).
+interface MeetingFileData extends Omit<FieldsData, 'recipients' | 'apptRecur'> {
+	bodyText?: string;
+	bodyPlainText?: string;
+	helper_currentDT?: string;
+	recipients?: Array<{ name?: string; email?: string }>;
+	apptRecur?: AppointmentRecur | null;
+	[key: string]: unknown;
+}
 
 const OutlookMeetingNotesDefaultFilenamePattern =
 	'{{#helper_dateFormat}}{{apptStartWhole}}|YYYY-MM-DD_HH-mm_ss{{/helper_dateFormat}}_{{subject}}';
@@ -51,7 +66,7 @@ export default class OutlookMeetingNotes extends Plugin {
 				throw new TypeError('Outlook Event Notes cannot process the file. '
 					+ 'It is a valid msg file but not an appointment or meeting.');
 			}
-			await this.createNoteFromFileData(origFileData as any, dragText);
+			await this.createNoteFromFileData(origFileData as MeetingFileData, dragText);
 		} catch (ee: unknown) {
 			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
@@ -61,7 +76,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// Shared note-creation logic used by both the .msg path and the .ics path.
 	// fileData must have: subject, apptStartWhole, apptEndWhole, apptLocation,
 	// body/bodyText/bodyHtml, recipients[], apptRecur (null = skip date correction).
-	private async createNoteFromFileData(origFileData: any, dragText = ''): Promise<void> {
+	private async createNoteFromFileData(origFileData: MeetingFileData, dragText = ''): Promise<void> {
 		const { vault } = this.app;
 
 		this.addHelperFunctions(origFileData);
@@ -90,7 +105,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			proxyData(fileData),
 			undefined,
 			fileNameEscape)
-			.replaceAll(/[*\"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
+			.replaceAll(/[*"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
 		const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
 		const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
 		let meetingNoteFile = vault.getFileByPath(filePath);
@@ -105,13 +120,13 @@ export default class OutlookMeetingNotes extends Plugin {
 			new Notice('New file created: ' + meetingNoteFile.basename);
 		}
 		const openInNewTab = false;
-		this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
+		void this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
 		// @ts-ignore: Property 'internalPlugins' does not exist on type 'App'.
 		const fe = this.app.internalPlugins.getEnabledPluginById("file-explorer");
 		if (fe) { fe.revealInFolder(meetingNoteFile); }
 	}
 
-	private ensureBodyField(fileData: any): void {
+	private ensureBodyField(fileData: MeetingFileData): void {
 		const hasBodyString = typeof fileData.body === 'string' && fileData.body.trim() !== '';
 		if (hasBodyString) { return; }
 		const fallbacks = [
@@ -129,7 +144,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		fileData.body = '';
 	}
 
-	private ensureDefaultFields(fileData: any): void {
+	private ensureDefaultFields(fileData: MeetingFileData): void {
 		const stringDefaults = ['subject', 'apptLocation', 'apptStartWhole', 'apptEndWhole'];
 		for (const field of stringDefaults) {
 			if (fileData[field] == null) { fileData[field] = ''; }
@@ -155,7 +170,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// Accepts both Outlook .msg files and iCalendar .ics files.
 	// Drag a meeting directly from the Outlook Calendar view to get an .ics file
 	// whose DTSTART is always the exact occurrence date (no dialog needed).
-	async handleDropEvent(dropevt: DragEvent) {
+	handleDropEvent(dropevt: DragEvent) {
 		if (dropevt.dataTransfer == null) {
 			throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The event had a null '
 				+ 'dataTransfer property, which should never happen when dispatched by the browser, according '
@@ -259,15 +274,15 @@ export default class OutlookMeetingNotes extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	addHelperFunctions(hash: any): any {
+	addHelperFunctions(hash: MeetingFileData): MeetingFileData {
 		const helperFunctions = {
 			firstWord: () => {
-				return function (words: string, render: any) {
+				return function (words: string, render: (text: string) => string) {
 					return render(words).replace(/\W.*$/, '');
 				}
 			},
 			dateFormat: () => {
-				return function (datetime_format: string, render: any) {
+				return function (datetime_format: string, render: (text: string) => string) {
 					const parts = datetime_format.split('|');
 					const rawValue = render(parts[0]).trim().replace(/^"|"$/g, '');
 					const formattedMoment = moment(rawValue);
@@ -281,12 +296,12 @@ export default class OutlookMeetingNotes extends Plugin {
 			hash['helper_' + func] = helperFunctions[func];
 		}
 		// Add helper functions to array items so they work inside mustache sections
-		for (let property in hash) {
+		for (const property in hash) {
 			if (hash[property] instanceof Array) {
-				for (let subproperty in hash[property]) {
-					if (hash[property][subproperty] instanceof Object) {
+				for (const subItem of hash[property] as MeetingFileData[]) {
+					if (subItem instanceof Object) {
 						for (func in helperFunctions) {
-							hash[property][subproperty]['helper_' + func] = helperFunctions[func];
+							subItem['helper_' + func] = helperFunctions[func];
 						}
 					}
 				}
@@ -297,7 +312,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	}
 
 	// Parse template into YAML and markdown sections to use different escaping for each
-	renderTemplate(template: string, hash: any): string {
+	renderTemplate(template: string, hash: MeetingFileData): string {
 		// Matches '---' frontmatter block at the start of the string
 		const templateYAMLMatch = template.match(/^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s);
 		const templateMD = templateYAMLMatch ? template.substring(templateYAMLMatch[0].length) : template;
@@ -312,8 +327,8 @@ export default class OutlookMeetingNotes extends Plugin {
 					const found = sanitized.match(/\r\n?|\n/);
 					if (found) {
 						return '|\n' + '  ' + sanitized.replaceAll(/\r\n?|\n/g, '\n  ');
-					} else if (sanitized.match(/[:#\[\]\{\},]/)) {
-						return '"' + sanitized.replaceAll(/["\\]/g, '\$&') + '"';
+					} else if (sanitized.match(/[:#[\]{},]/)) {
+						return '"' + sanitized.replaceAll(/["\\]/g, '$&') + '"';
 					}
 					else return sanitized;
 				}
@@ -329,7 +344,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		if (templateMD) {
 			const mustacheMDOptions = {
 				escape: (str: string): string => {
-					return str.replaceAll(/[\\\`\*\_\[\]\{\}\<\>\(\)\#\!\|\^]/g, '\\$&')
+					return str.replaceAll(/[\\`*_[\]{}<>()#!|^]/g, '\\$&')
 						.replaceAll('%%', '\\%\\%')
 						.replaceAll('~~', '\\~\\~')
 						.replaceAll('==', '\\=\\=');
@@ -351,7 +366,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// createNoteFromFileData. DTSTART in .ics files is always the correct occurrence
 	// date (Outlook sets it to the specific occurrence when dragging from calendar view),
 	// so apptRecur is set to null to skip the recurring-event correction dialog.
-	private parseIcsFile(content: string): any {
+	private parseIcsFile(content: string): MeetingFileData {
 		// RFC 5545 §3.1: unfold continuation lines (lines starting with whitespace)
 		const text = content
 			.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
@@ -449,7 +464,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	//   2. If still unknown, show a date-picker dialog pre-filled with the
 	//      occurrence from the recurrence pattern closest to today.
 	// Returns false if the user cancelled the dialog (caller should abort note creation).
-	private async correctRecurringOccurrenceDate(fileData: any, dragText = ''): Promise<boolean> {
+	private async correctRecurringOccurrenceDate(fileData: MeetingFileData, dragText = ''): Promise<boolean> {
 		const apptRecur = fileData.apptRecur;
 		if (!apptRecur?.recurrencePattern) return true;
 
@@ -495,7 +510,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			const parsedIsUseful = parsedDate
 				&& parsedDate.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD');
 			if (parsedIsUseful) {
-				corrected = withDate(parsedDate!);
+				corrected = withDate(parsedDate);
 			} else {
 				// Could not extract the date automatically — show a date-picker dialog.
 				// Pre-fill with the occurrence nearest to today (rather than the series
@@ -609,7 +624,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// arises when startDate (always midnight UTC) is converted to local time.
 	// Respects the series end date so past-ended or future series return the
 	// closest valid occurrence rather than falling back to the series start.
-	private findClosestOccurrence(apptRecur: any, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
+	private findClosestOccurrence(apptRecur: AppointmentRecur, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
 		try {
 			const rp = apptRecur.recurrencePattern;
 
@@ -816,7 +831,7 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 				link.href = 'https://github.com/nathanstorm689/outlook-event-notes#readme';
 				link.target = '_blank';
 				link.rel = 'noopener';
-				link.textContent = 'documentation';
+				link.textContent = 'Documentation';
 				df.appendChild(link);
 				df.appendChild(document.createTextNode('.'));
 				return df;
@@ -830,7 +845,7 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 				link.href = 'https://buymeacoffee.com/nathanstorm';
 				link.target = '_blank';
 				link.rel = 'noopener';
-				link.textContent = 'buying me a coffee';
+				link.textContent = 'Buying me a coffee';
 				df.appendChild(link);
 				df.appendChild(document.createTextNode(' ☕'));
 				return df;
