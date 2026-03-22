@@ -9,6 +9,11 @@ export default [
 			parser: tsparser,
 			parserOptions: { project: "./tsconfig.json" },
 		},
-		rules: obsidianmd.configs.recommended,
+		rules: {
+			...obsidianmd.configs.recommended,
+			"obsidianmd/ui/sentence-case": ["error", {
+				brands: ["Outlook", "Classic", "Microsoft"]
+			}],
+		},
 	},
 ];
