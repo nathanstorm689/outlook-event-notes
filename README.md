@@ -6,6 +6,8 @@ An [Obsidian](https://obsidian.md) plugin that creates notes from Microsoft Outl
 
 ![Demo: dragging an Outlook meeting onto the ribbon icon creates a note](docs/demo.gif)
 
+![The resulting note's properties: title, subtitle, created date, meeting flag, and recipients](docs/note-example.png)
+
 > **Based on [Outlook Meeting Notes](https://github.com/davidingerslev/outlook-meeting-notes) by [David Ingerslev](https://github.com/davidingerslev).**
 > This fork adds support for recurring events, opening existing notes, and other improvements.
 
