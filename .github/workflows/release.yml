@@ -4,7 +4,7 @@ name: Release Obsidian plugin
 # Builds the plugin from source, attaches a cryptographic build-provenance
 # attestation to main.js and styles.css (proving they were built from this
 # repository by this workflow, not hand-uploaded), and publishes the GitHub
-# Release with all three required assets.
+# Release with all three required assets and written notes from release-notes/<version>.md.
 
 on:
   push:
@@ -22,14 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check release notes
+        run: test -s "release-notes/${GITHUB_REF_NAME}.md"
+
       - name: Use Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20.x"
 
-      - name: Build plugin
+      - name: Test and build plugin
         run: |
           npm ci
+          npm test
+          npx --no-install eslint main.ts
           npm run build
 
       - name: Attest build provenance
@@ -47,5 +52,7 @@ jobs:
 
           gh release create "$tag" \
             --title="$tag" \
-            --generate-notes \
+            --verify-tag \
+            --latest \
+            --notes-file="release-notes/$tag.md" \
             main.js manifest.json styles.css

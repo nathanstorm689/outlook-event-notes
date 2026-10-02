@@ -2,7 +2,7 @@
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-nathanstorm-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/nathanstorm)
 
-An [Obsidian](https://obsidian.md) plugin that creates notes from Microsoft Outlook meetings, appointments, and recurring events by dragging and dropping `.msg` files onto a ribbon icon.
+An [Obsidian](https://obsidian.md) plugin that creates notes from Microsoft Outlook meetings, appointments, and recurring events by dragging and dropping Outlook `.msg` files or exported `.ics` files onto a ribbon icon.
 
 ![Demo: dragging an Outlook meeting onto the ribbon icon creates a note](docs/demo.gif)
 
@@ -16,10 +16,10 @@ An [Obsidian](https://obsidian.md) plugin that creates notes from Microsoft Outl
 ## Features
 
 - **Drag & drop** a meeting or appointment from Outlook Classic onto the ribbon icon → a note is instantly created (or opened if it already exists)
-- **Recurring events** — detects recurring `.msg` files and prompts you to confirm the occurrence date before creating the note
+- **Recurring events** — uses the occurrence date supplied by Outlook when available, or asks you to confirm a suggested date
 - **Fully customisable** filename pattern and note template using [Mustache](https://mustache.github.io/mustache.5.html) syntax
-- **No Microsoft 365 / Graph API dependency** — works entirely from `.msg` files
-- **YAML frontmatter sanitisation** — strips characters that would break Obsidian properties
+- **No Microsoft 365 / Graph API dependency** — processes `.msg` and `.ics` files locally
+- **Safe note properties** — quotes and escapes imported text so punctuation and multiline invitations remain valid YAML
 
 ## Installation
 
@@ -38,17 +38,21 @@ Search for **Outlook Event Notes** in Obsidian → Settings → Community Plugin
 Drag and drop a meeting or appointment from the **Outlook Classic** desktop calendar onto the plugin ribbon icon. The plugin will:
 
 1. Parse the `.msg` file
-2. For recurring events, ask you to confirm the occurrence date (defaults to today)
+2. For recurring events, use the supplied occurrence date or ask you to confirm the nearest calculated occurrence
 3. Create a new note — or open the existing one if a note for that event already exists
 
-You can also save a `.msg` file from Outlook (e.g. a meeting invitation received by email) and drag-drop the saved file onto the icon.
+You can also save a calendar appointment or meeting as a `.msg` or `.ics` file and drop it onto the icon. A `.msg` email or invitation message is not a calendar appointment; open the event in your calendar before saving it. Import one file containing one event at a time.
 
 ### Recurring events
-If the dropped `.msg` represents part of a recurring series, the plugin shows a modal asking for the occurrence date in `YYYY-MM-DD` format. Press Enter to accept the default (today), adjust the date if needed, or cancel to abort note creation.
+For recurring `.msg` files, the plugin first looks for the occurrence date in the file and the drag text. If neither provides a usable date, a dialog suggests the nearest valid occurrence from the recurrence pattern. Confirm or correct that date, or cancel to stop importing.
+
+A recurring `.ics` series without an explicit occurrence asks you to enter the date. Unsupported recurrence patterns, including Hijri patterns, can also require manual date selection. Always use the date shown in your calendar.
 
 ---
 
 ## Settings
+
+The settings page includes the installed version, author, compatibility details, documentation and support links, and a **Buy me a coffee** button. Your existing settings are kept when you update.
 
 ### Folder location
 The folder where new notes are created. Created automatically if it does not exist (supports subfolders like `Meetings/2026`).
@@ -60,11 +64,7 @@ Uses Mustache syntax. Default:
 ```
 Produces filenames like `2026-07-30_18-20-05 Réunion d'équipe`.
 
-You can use `/` to create subfolders:
-```
-{{#helper_dateFormat}}{{apptStartWhole}}|YYYY/MM/YYYY-MM-DD_HH-mm-ss{{/helper_dateFormat}} {{subject}}
-```
-produces `2026/07/2026-07-30_18-20-05 Réunion d'équipe`
+Use **Folder location** to choose subfolders. Slashes in the filename pattern are treated as invalid filename characters.
 
 ### Invalid character substitute
 Characters that are invalid in filenames (`/ * " \ < > : | ?`) are replaced with this value. Blank = remove them.
@@ -72,7 +72,7 @@ Characters that are invalid in filenames (`/ * " \ < > : | ?`) are replaced with
 ### Template
 Fully customisable Mustache template. All `.msg` [fields](https://hiraokahypertools.github.io/msgreader/typedoc/interfaces/MsgReader.FieldsData.html) are available, plus the helper fields and functions below.
 
-YAML values are sanitised automatically to strip characters such as `<`, `>` and `*`, keeping the generated frontmatter valid even when invite data contains those symbols.
+Imported values in YAML properties are quoted and escaped automatically, preserving punctuation, leading blank lines, and multiline invitation text. Existing notes are opened without being rewritten; this update does not repair older notes automatically.
 
 #### Default template
 ```
@@ -137,6 +137,10 @@ meeting-recipients:
 - [msgreader](https://github.com/HiraokaHyperTools/msgreader) — `.msg` file parsing
 - [mustache.js](https://github.com/janl/mustache.js) — template rendering
 - [mustache-validator](https://github.com/eliasm307/mustache-validator) — template validation
+- [ical.js](https://github.com/kewisch/ical.js) — iCalendar parsing
+- [windows-iana](https://github.com/rubenillodo/windows-iana) — Windows time-zone name mapping
+
+See [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) for additional library notices.
 
 ---
 

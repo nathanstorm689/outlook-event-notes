@@ -1,4 +1,4 @@
-import { App, displayTooltip, Modal, moment as _moment, Notice, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, TooltipPlacement, normalizePath } from 'obsidian';
+import { App, displayTooltip, Modal, moment as _moment, Notice, Plugin, PluginSettingTab, Setting, SettingDefinitionItem, TooltipPlacement, normalizePath, setIcon } from 'obsidian';
 import MsgReader, { AppointmentRecur, FieldsData, PatternType } from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
@@ -824,108 +824,140 @@ class OutlookMeetingNotesSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	// Declarative metadata so these settings are found by Obsidian's settings
-	// search (available since 1.13.0). Rendering is still handled by display()
-	// below, since the imperative API gives finer control over the template
-	// text area and the documentation/donation links.
-	getSettingDefinitions(): SettingDefinitionItem[] {
+	private textSettings(): Array<{
+		key: 'notesFolder' | 'fileNamePattern' | 'invalidFilenameCharReplacement';
+		name: string; desc: string; placeholder: string; wide?: boolean;
+	}> {
 		return [
 			{
-				name: 'Folder location',
-				desc: 'Notes will be created in this folder.',
-				control: { type: 'text', key: 'notesFolder' },
+				key: 'notesFolder', name: 'Folder location',
+				desc: 'Leave blank to use the vault root. Subfolders are created when needed.',
+				placeholder: 'Meetings/2026',
 			},
 			{
-				name: 'Filename pattern',
-				desc: 'This pattern will be used to name new notes.',
-				control: { type: 'text', key: 'fileNamePattern' },
+				key: 'fileNamePattern', name: 'Filename pattern',
+				desc: 'Use Mustache fields and date helpers to name your notes. Leave blank to use the default pattern.',
+				placeholder: OutlookMeetingNotesDefaultFilenamePattern, wide: true,
 			},
 			{
-				name: 'Invalid character substitute',
-				desc: 'This character (or string) will be used in place of any invalid characters for new note filenames.',
-				control: { type: 'text', key: 'invalidFilenameCharReplacement' },
-			},
-			{
-				name: 'Template',
-				desc: 'This template will be used for new notes.',
-				control: { type: 'textarea', key: 'notesTemplate' },
+				key: 'invalidFilenameCharReplacement', name: 'Invalid character substitute',
+				desc: 'Replace characters that cannot appear in filenames. Leave blank to remove them.',
+				placeholder: '_',
 			},
 		];
 	}
 
+	// Obsidian 1.13+ renders these definitions instead of calling display().
+	// Shared renderers keep donation links and controls available in both paths.
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const manifest = this.plugin.manifest;
+		return [
+			{
+				name: 'Plugin information',
+				desc: `${manifest.name}. Version ${manifest.version}. By ${manifest.author}.`,
+				aliases: ['about', 'version', 'author', 'support', 'donate', 'coffee', 'documentation'],
+				render: setting => this.renderPluginInfo(setting),
+			},
+			{
+				type: 'group', heading: 'Notes',
+				items: this.textSettings().map(row => ({
+					name: row.name, desc: row.desc,
+					render: setting => this.renderTextSetting(setting, row),
+				})),
+			},
+			{
+				type: 'group', heading: 'Note template',
+				items: [{
+					name: 'Template',
+					desc: 'Customize the properties and text added to new notes. Existing notes are opened without replacing their contents.',
+					render: setting => this.renderTemplateSetting(setting),
+				}],
+			},
+		];
+	}
+
+	private renderPluginInfo(setting: Setting): void {
+		const manifest = this.plugin.manifest;
+		const repository = 'https://github.com/nathanstorm689/outlook-event-notes';
+		setting.setName(manifest.name).setHeading().setClass('outlook-event-notes-plugin-info');
+		const icon = setting.nameEl.createEl('span', {
+			cls: 'outlook-event-notes-info-icon', attr: { 'aria-hidden': 'true' },
+		});
+		setIcon(icon, 'calendar-clock');
+		setting.nameEl.prepend(icon);
+		setting.nameEl.createEl('span', {
+			text: `Version ${manifest.version}`, cls: 'outlook-event-notes-version',
+		});
+		setting.setDesc(createFragment(fragment => {
+			fragment.createEl('p', { text: manifest.description, cls: 'outlook-event-notes-description' });
+			const metadata = fragment.createEl('div', { cls: 'outlook-event-notes-metadata' });
+			const author = metadata.createEl('span');
+			author.appendText('By ');
+			if (manifest.authorUrl) {
+				author.createEl('a', {
+					text: manifest.author, href: manifest.authorUrl,
+					attr: { target: '_blank', rel: 'noopener noreferrer' },
+				});
+			} else author.appendText(manifest.author);
+			metadata.createEl('span', { text: `Obsidian ${manifest.minAppVersion}+` });
+			if (manifest.isDesktopOnly) metadata.createEl('span', { text: 'Desktop only' });
+		}));
+		setting.controlEl.addClass('outlook-event-notes-links');
+		const links = [
+			{ text: 'Buy me a coffee', href: 'https://buymeacoffee.com/nathanstorm', icon: 'coffee', support: true },
+			{ text: 'Documentation', href: repository + '#readme', icon: 'book-open' },
+			{ text: 'Source code', href: repository, icon: 'github' },
+			{ text: 'Release notes', href: repository + '/releases', icon: 'history' },
+			{ text: 'Report a problem', href: repository + '/issues', icon: 'bug' },
+		];
+		for (const link of links) {
+			const anchor = setting.controlEl.createEl('a', {
+				href: link.href, cls: 'outlook-event-notes-settings-link',
+				attr: { target: '_blank', rel: 'noopener noreferrer' },
+			});
+			if (link.support) anchor.addClass('outlook-event-notes-support-link');
+			const linkIcon = anchor.createEl('span', { attr: { 'aria-hidden': 'true' } });
+			setIcon(linkIcon, link.icon);
+			anchor.createEl('span', { text: link.text });
+		}
+	}
+
+	private renderTextSetting(setting: Setting, row: ReturnType<OutlookMeetingNotesSettingTab['textSettings']>[number]): void {
+		setting.setName(row.name).setDesc(row.desc);
+		if (row.wide) setting.setClass('outlook-event-notes-wide-setting');
+		setting.addText(text => text
+			.setPlaceholder(row.placeholder)
+			.setValue(this.plugin.settings[row.key])
+			.onChange(async value => {
+				this.plugin.settings[row.key] = row.key === 'fileNamePattern' && value === ''
+					? OutlookMeetingNotesDefaultFilenamePattern : value;
+				await this.plugin.saveSettings();
+			}));
+	}
+
+	private renderTemplateSetting(setting: Setting): void {
+		setting.setName('Template')
+			.setDesc('Customize the properties and text added to new notes. Existing notes are opened without replacing their contents.')
+			.setClass('outlook-event-notes-wide-setting')
+			.addTextArea(text => {
+				text.inputEl.rows = 12;
+				text.inputEl.spellcheck = false;
+				text.setPlaceholder(OutlookMeetingNotesDefaultTemplate)
+					.setValue(this.plugin.settings.notesTemplate)
+					.onChange(async value => {
+						this.plugin.settings.notesTemplate = value;
+						await this.plugin.saveSettings();
+					});
+			});
+	}
+
+	// Fallback for supported Obsidian versions older than 1.13.
 	display(): void {
-		const { containerEl } = this;
-
-		containerEl.empty();
-
-		new Setting(containerEl)
-			.setName('Folder location')
-			.setDesc('Notes will be created in this folder.')
-			.addText(text => text
-				.setPlaceholder('Example: folder 1/subfolder 2')
-				.setValue(this.plugin.settings.notesFolder)
-				.onChange(async (value) => {
-					this.plugin.settings.notesFolder = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Filename pattern')
-			.setDesc('This pattern will be used to name new notes.')
-			.addText(text => text
-				.setPlaceholder('Default: ' + OutlookMeetingNotesDefaultFilenamePattern)
-				.setValue(this.plugin.settings.fileNamePattern)
-				.onChange(async (value) => {
-					if (value == '') {
-						this.plugin.settings.fileNamePattern = OutlookMeetingNotesDefaultFilenamePattern;
-					} else {
-						this.plugin.settings.fileNamePattern = value;
-					}
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Invalid character substitute')
-			.setDesc('This character (or string) will be used in place of any invalid characters for new note filenames.')
-			.addText(text => text
-				.setPlaceholder('Example: _')
-				.setValue(this.plugin.settings.invalidFilenameCharReplacement)
-				.onChange(async (value) => {
-					this.plugin.settings.invalidFilenameCharReplacement = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setName('Template')
-			.setDesc('This template will be used for new notes.')
-			.addTextArea(text => text
-				.setPlaceholder('Default: ' + OutlookMeetingNotesDefaultFilenamePattern)
-				.setValue(this.plugin.settings.notesTemplate)
-				.onChange(async (value) => {
-					this.plugin.settings.notesTemplate = value;
-					await this.plugin.saveSettings();
-				}));
-
-		new Setting(containerEl)
-			.setDesc(createFragment(df => {
-				df.appendText('For more information about filename patterns and the syntax for templates, see the ');
-				df.createEl('a', {
-					text: 'Documentation',
-					href: 'https://github.com/nathanstorm689/outlook-event-notes#readme',
-					attr: { target: '_blank', rel: 'noopener' }
-				});
-				df.appendText('.');
-			}));
-
-		new Setting(containerEl)
-			.setDesc(createFragment(df => {
-				df.appendText('If this plugin saves you time, consider ');
-				df.createEl('a', {
-					text: 'Buying me a coffee',
-					href: 'https://buymeacoffee.com/nathanstorm',
-					attr: { target: '_blank', rel: 'noopener' }
-				});
-				df.appendText(' ☕');
-			}));
+		this.containerEl.empty();
+		this.renderPluginInfo(new Setting(this.containerEl));
+		new Setting(this.containerEl).setName('Notes').setHeading();
+		for (const row of this.textSettings()) this.renderTextSetting(new Setting(this.containerEl), row);
+		new Setting(this.containerEl).setName('Note template').setHeading();
+		this.renderTemplateSetting(new Setting(this.containerEl));
 	}
 }
