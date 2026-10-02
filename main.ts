@@ -648,11 +648,13 @@ export default class OutlookMeetingNotes extends Plugin {
 
 			// Determine the last valid occurrence date if the series has an end date.
 			// endDate is stored in the same minutes-since-1601 format as startDate.
+			// Read the encoded calendar date in UTC, then keep that date at local midnight.
+			// A normal UTC-to-local conversion can move it to the previous day.
 			// A value of 0x5AE980DF (1525252319) is Outlook's sentinel for "no end date".
 			const OUTLOOK_NO_END = 0x5AE980DF;
 			const lastOccDate: moment.Moment | null =
 				rp.endDate && rp.endDate !== OUTLOOK_NO_END
-					? this.dateFromRecurMinutes(rp.endDate)
+					? this.dateFromRecurMinutes(rp.endDate).utc().local(true)
 					: null;
 
 			const candidates: moment.Moment[] = [];
