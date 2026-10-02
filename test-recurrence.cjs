@@ -20,16 +20,17 @@ function loadMethods(repo, names, Modal = class {}) {
     const method = plugin.members.find(n => n.name?.getText(source) === name);
     assert.ok(method, `Missing method: ${name}`);
     return method.getText(source);
-  }).join('\n');
+  });
+  const allMethods = plugin.members.filter(n => ts.isMethodDeclaration(n)).map(n => n.getText(source)).join('\n');
   const code = ts.transpileModule(
-    `module.exports = (moment, PatternType, OccurrenceDateModal) => new class { ${methods} };`,
+    `module.exports = (moment, PatternType, OccurrenceDateModal, ICAL, findIana) => new class { ${allMethods} };`,
     { compilerOptions: { target: ts.ScriptTarget.ES2021, module: ts.ModuleKind.CommonJS } }
   ).outputText;
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'outlook-recurrence-'));
   const file = path.join(temp, 'methods.cjs');
   try {
     fs.writeFileSync(file, code);
-    return { plugin: require(file)(moment, PatternType, Modal), moment, PatternType };
+    return { plugin: require(file)(moment, PatternType, Modal, localRequire('ical.js'), localRequire('windows-iana').findIana), moment, PatternType };
   } finally {
     delete require.cache[file];
     fs.unlinkSync(file);

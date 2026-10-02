@@ -2,6 +2,8 @@ import { App, displayTooltip, Modal, moment as _moment, Notice, Plugin, PluginSe
 import MsgReader, { AppointmentRecur, FieldsData, PatternType } from '@kenjiuno/msgreader';
 import proxyData from 'mustache-validator';
 import Mustache from 'mustache';
+import ICAL from 'ical.js';
+import { findIana } from 'windows-iana';
 
 // moment is provided by Obsidian's bundle; importing from 'obsidian' satisfies the plugin review requirement.
 // The namespace-style re-export in obsidian.d.ts loses the callable signature, so we cast it here.
@@ -10,7 +12,18 @@ const moment = _moment as unknown as typeof import('moment/moment');
 // MeetingFileData extends FieldsData with additional dynamic fields added at runtime.
 // recipients is widened to include plain {name, email} objects from .ics parsing.
 // apptRecur is widened to allow null (used by .ics path to skip occurrence correction).
+type IcalComponent = InstanceType<typeof ICAL.Component>;
+type IcalProperty = InstanceType<typeof ICAL.Property>;
+type IcalTime = InstanceType<typeof ICAL.Time>;
+type OutlookZoneTransition = NonNullable<FieldsData['timeZoneStruct']>['standardDate'];
+interface MeetingClock {
+	toWall(instant: moment.Moment): moment.Moment;
+	fromWall(wall: moment.Moment): moment.Moment;
+}
+
 interface MeetingFileData extends Omit<FieldsData, 'recipients' | 'apptRecur'> {
+	needsOccurrenceDate?: boolean;
+	icsOccurrence?: { clock: MeetingClock; startWall: moment.Moment; calendarDays: number; seconds: number };
 	bodyText?: string;
 	bodyPlainText?: string;
 	helper_currentDT?: string;
@@ -56,7 +69,7 @@ export default class OutlookMeetingNotes extends Plugin {
 	// dragText: the plain-text representation of the appointment from the DataTransfer.
 	// Outlook Classic puts it there when dragging from the calendar; it contains the
 	// occurrence's actual "Start:" date, which lets us skip the manual-date dialog.
-	async createMeetingNote(msg: MsgReader, dragText = '') {
+	async createMeetingNote(msg: MsgReader, dragText = '', notifyErrors = true) {
 		try {
 			const origFileData = msg.getFileData();
 			if (origFileData.dataType != 'msg') {
@@ -68,7 +81,7 @@ export default class OutlookMeetingNotes extends Plugin {
 			}
 			await this.createNoteFromFileData(origFileData as MeetingFileData, dragText);
 		} catch (ee: unknown) {
-			if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
+			if (notifyErrors && ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
 			throw ee;
 		}
 	}
@@ -78,49 +91,42 @@ export default class OutlookMeetingNotes extends Plugin {
 	// body/bodyText/bodyHtml, recipients[], apptRecur (null = skip date correction).
 	private async createNoteFromFileData(origFileData: MeetingFileData, dragText = ''): Promise<void> {
 		const { vault } = this.app;
-
-		this.addHelperFunctions(origFileData);
-		let fileData = origFileData;
-		fileData.helper_currentDT = moment().format();
-
+		const fileData = origFileData;
 		this.ensureBodyField(fileData);
 		this.ensureDefaultFields(fileData);
-
-		// For recurring .msg events, apptStartWhole may carry only the series start date.
-		// correctRecurringOccurrenceDate fixes it (using drag text, GlobalObjectId, or dialog).
-		// For .ics files apptRecur is null, so this returns true immediately.
-		const dateOk = await this.correctRecurringOccurrenceDate(fileData, dragText);
-		if (!dateOk) return; // user cancelled the date dialog
+		const start = this.parseMeetingDate(fileData.apptStartWhole);
+		const end = this.parseMeetingDate(fileData.apptEndWhole);
+		if (!start.isValid()) throw new TypeError('The meeting has no valid start date.');
+		if (!end.isValid() || end.isBefore(start)) throw new TypeError('The meeting has no valid end date.');
+		if (fileData.needsOccurrenceDate && !(await this.correctIcsOccurrenceDate(fileData))) return;
+		if (!(await this.correctRecurringOccurrenceDate(fileData, dragText))) return;
+		this.addHelperFunctions(fileData);
+		fileData.helper_currentDT = moment().format();
 
 		let targetFolderPath = (this.settings.notesFolder ?? '').trim();
-		if (targetFolderPath === '' || targetFolderPath === '/') { targetFolderPath = ''; }
-		else { targetFolderPath = normalizePath(targetFolderPath); }
-		const fileNameEscape = {
-			escape: (str: string): string => {
-				return str.replaceAll('/', this.settings.invalidFilenameCharReplacement);
-			}
-		}
-		const fileNameMustache = Mustache.render(
-			this.settings.fileNamePattern,
-			proxyData(fileData),
-			undefined,
-			fileNameEscape)
-			.replaceAll(/[*"\\<>:|?]/g, this.settings.invalidFilenameCharReplacement);
-		const folderPrefix = targetFolderPath === '' ? '' : targetFolderPath + '/';
-		const filePath = normalizePath(folderPrefix + fileNameMustache + '.md');
+		if (targetFolderPath === '' || targetFolderPath === '/') targetFolderPath = '';
+		else targetFolderPath = normalizePath(targetFolderPath);
+		if (targetFolderPath.split('/').some(p => p === '..' || p === '.')) throw new TypeError('The notes folder must be inside the vault.');
+		const renderedName = Mustache.render(this.settings.fileNamePattern, proxyData(fileData), undefined, { escape: (s: string) => s });
+		const filePath = normalizePath((targetFolderPath ? targetFolderPath + '/' : '') + this.sanitizeNoteName(renderedName) + '.md');
 		let meetingNoteFile = vault.getFileByPath(filePath);
-		if (meetingNoteFile) {
-			new Notice(meetingNoteFile.basename + ' already exists: opening it');
-		} else {
-			if (targetFolderPath !== '' && vault.getFolderByPath(targetFolderPath) == null) {
-				await vault.createFolder(targetFolderPath);
+		let created = false;
+		if (!meetingNoteFile) {
+			if (targetFolderPath && !vault.getFolderByPath(targetFolderPath)) {
+				try { await vault.createFolder(targetFolderPath); }
+				catch (error) { if (!vault.getFolderByPath(targetFolderPath)) throw error; }
 			}
-			const mustacheOutput = this.renderTemplate(this.settings.notesTemplate, fileData);
-			meetingNoteFile = await vault.create(filePath, mustacheOutput);
-			new Notice('New file created: ' + meetingNoteFile.basename);
+			try {
+				meetingNoteFile = await vault.create(filePath, this.renderTemplate(this.settings.notesTemplate, fileData));
+				created = true;
+			} catch (error) {
+				// Another drop may have completed while this one was waiting for disk I/O.
+				meetingNoteFile = vault.getFileByPath(filePath);
+				if (!meetingNoteFile) throw error;
+			}
 		}
-		const openInNewTab = false;
-		void this.app.workspace.getLeaf(openInNewTab).openFile(meetingNoteFile);
+		new Notice(created ? 'New file created: ' + meetingNoteFile.basename : meetingNoteFile.basename + ' already exists: opening it');
+		await this.app.workspace.getLeaf(false).openFile(meetingNoteFile);
 	}
 
 	private ensureBodyField(fileData: MeetingFileData): void {
@@ -165,62 +171,37 @@ export default class OutlookMeetingNotes extends Plugin {
 
 	// Handle a file being dropped onto the ribbon icon.
 	// Accepts both Outlook .msg files and iCalendar .ics files.
-	// Drag a meeting directly from the Outlook Calendar view to get an .ics file
-	// whose DTSTART is always the exact occurrence date (no dialog needed).
-	handleDropEvent(dropevt: DragEvent) {
-		if (dropevt.dataTransfer == null) {
-			throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The event had a null '
-				+ 'dataTransfer property, which should never happen when dispatched by the browser, according '
-				+ 'to https://developer.mozilla.org/en-US/docs/Web/API/DragEvent/dataTransfer');
-		} else {
-			const droppedFiles = dropevt.dataTransfer.files;
-			if (droppedFiles.length === 0) {
-				new Notice('No file received. The new Outlook app does not support drag-and-drop — please use Outlook Classic, or export the event as .ics and drop that instead.');
-			} else if (droppedFiles.length > 1) {
-				new Notice('Only one meeting file can be dropped at a time.');
-			} else {
-				const droppedFile = droppedFiles[0];
-				const isIcs = droppedFile.name.toLowerCase().endsWith('.ics')
-					|| droppedFile.type === 'text/calendar';
-
-				if (isIcs) {
-					// iCalendar file: read as text and parse.
-					// DTSTART is always the correct occurrence date → no dialog needed.
-					const fr = new FileReader();
-					fr.onload = async () => {
-						try {
-							const fileData = this.parseIcsFile(fr.result as string);
-							await this.createNoteFromFileData(fileData);
-						} catch (ee: unknown) {
-							if (ee instanceof Error) { new Notice('Error (' + ee.name + '):\n' + ee.message); }
-						}
-					};
-					fr.readAsText(droppedFile, 'utf-8');
-				} else {
-					// Outlook .msg binary file.
-					// Read the plain-text representation NOW (before the async FileReader),
-					// while dataTransfer is still accessible. Outlook Classic puts the
-					// appointment text here when dragging from the calendar view, including
-					// the occurrence's actual "Start:" / "Début :" date.
-					const dragText = dropevt.dataTransfer?.getData('text/plain') ?? '';
-
-					const fr = new FileReader();
-					fr.onload = async () => {
-						if (fr.result == null) {
-							throw new ReferenceError('Outlook Event Notes cannot handle the DragEvent. The FileReader had '
-								+ 'a null result property, which should not be possible.');
-						} else if (!(fr.result instanceof ArrayBuffer)) {
-							throw new TypeError('Outlook Event Notes cannot handle the DragEvent. The FileReader result '
-								+ 'property was not an ArrayBuffer, which should be impossible.');
-						} else {
-							const msgRdr = new MsgReader(fr.result);
-							await this.createMeetingNote(msgRdr, dragText);
-						}
-					};
-					fr.readAsArrayBuffer(droppedFile);
-				}
-			}
+	// Recurring series exports can require explicit occurrence selection.
+	handleDropEvent(dropevt: DragEvent): void {
+		const transfer = dropevt.dataTransfer;
+		if (!transfer || transfer.files.length === 0) {
+			new Notice('No file received. Use Outlook Classic, or export one meeting as a .msg or .ics file.');
+			return;
 		}
+		if (transfer.files.length !== 1) { new Notice('Only one meeting file can be dropped at a time.'); return; }
+		const file = transfer.files[0];
+		const isIcs = /\.ics$/i.test(file.name) || file.type.toLowerCase() === 'text/calendar';
+		if (!isIcs && !/\.msg$/i.test(file.name)) { new Notice('Choose a .msg or .ics meeting file.'); return; }
+		const fail = (error: unknown): void => { new Notice('Unable to import meeting: ' + (error instanceof Error ? error.message : String(error))); };
+		try {
+			const dragText = transfer.getData?.('text/plain') ?? '';
+			const reader = new FileReader();
+			reader.onerror = () => fail(reader.error ?? new Error('The file could not be read.'));
+			reader.onabort = () => fail(new Error('File reading was cancelled.'));
+			reader.onload = async () => {
+				try {
+					if (isIcs) {
+						if (typeof reader.result !== 'string') throw new TypeError('The calendar file could not be read as text.');
+						await this.createNoteFromFileData(this.parseIcsFile(reader.result));
+					} else {
+						if (!(reader.result instanceof ArrayBuffer)) throw new TypeError('The Outlook file could not be read.');
+						await this.createMeetingNote(new MsgReader(reader.result), dragText, false);
+					}
+				} catch (error) { fail(error); }
+			};
+			if (isIcs) reader.readAsText(file, 'utf-8');
+			else reader.readAsArrayBuffer(file);
+		} catch (error) { fail(error); }
 	}
 
 	private ribbonIconEl: HTMLElement;
@@ -274,7 +255,13 @@ export default class OutlookMeetingNotes extends Plugin {
 		const helperFunctions = {
 			firstWord: () => {
 				return function (words: string, render: (text: string) => string) {
-					return render(words).replace(/\W.*$/, '');
+					const rendered = render(words);
+					let raw = rendered;
+					try {
+						const decoded: unknown = JSON.parse(rendered);
+						if (typeof decoded === 'string') raw = decoded;
+					} catch { /* Plain text from the Markdown renderer. */ }
+					return raw.replace(/\W.*$/, '');
 				}
 			},
 			dateFormat: () => {
@@ -309,142 +296,124 @@ export default class OutlookMeetingNotes extends Plugin {
 
 	// Parse template into YAML and markdown sections to use different escaping for each
 	renderTemplate(template: string, hash: MeetingFileData): string {
-		// Matches '---' frontmatter block at the start of the string
-		const templateYAMLMatch = template.match(/^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s);
-		const templateMD = templateYAMLMatch ? template.substring(templateYAMLMatch[0].length) : template;
-
-		let output = ''
-
-		if (templateYAMLMatch) {
-			const sanitizeYamlValue = (value: string): string => value.replace(/[><*]/g, '');
-			const mustacheYAMLOptions = {
-				escape: (str: string): string => {
-					const sanitized = sanitizeYamlValue(str);
-					const found = sanitized.match(/\r\n?|\n/);
-					if (found) {
-						return '|\n' + '  ' + sanitized.replaceAll(/\r\n?|\n/g, '\n  ');
-					} else if (sanitized.match(/[:#[\]{},]/)) {
-						return '"' + sanitized.replaceAll(/["\\]/g, '$&') + '"';
-					}
-					else return sanitized;
+		const match = template.match(/^---(\r\n?|\n).*?(\r\n?|\n)---($|\r\n?|\n)/s);
+		let output = '';
+		if (match) {
+			// A quoted Mustache field needs escaping inside its existing YAML quotes.
+			const withHelpers = match[0].replace(/\{\{#(helper_firstWord|helper_dateFormat)\}\}[\s\S]*?\{\{\/\1\}\}/g, (section: string, _name: string, offset: number) => {
+				const prefix = match[0].slice(match[0].lastIndexOf('\n', offset - 1) + 1, offset);
+				// Leave explicitly quoted sections inside their existing YAML scalar.
+				let quote = '';
+				for (let i = 0; i < prefix.length; i++) {
+					if (quote === '"' && prefix[i] === '\\') { i++; continue; }
+					if (prefix[i] === quote) { if (quote === "'" && prefix[i + 1] === "'") i++; else quote = ''; }
+					else if (!quote && (prefix[i] === '"' || prefix[i] === "'")) quote = prefix[i];
 				}
-			}
-
-			output = output + Mustache.render(
-				templateYAMLMatch[0],
-				proxyData(hash),
-				undefined,
-				mustacheYAMLOptions);
-		}
-
-		if (templateMD) {
-			const mustacheMDOptions = {
-				escape: (str: string): string => {
-					return str.replaceAll(/[\\`*_[\]{}<>()#!|^]/g, '\\$&')
-						.replaceAll('%%', '\\%\\%')
-						.replaceAll('~~', '\\~\\~')
-						.replaceAll('==', '\\=\\=');
+				if (quote) return section;
+				return '{{#helper_yamlScalar}}' + section + '{{/helper_yamlScalar}}';
+			});
+			const yamlTemplate = withHelpers.replace(/\{\{\s*([^#^/!>&{=][^}]*?)\s*\}\}/g, (tag: string, name: string, offset: number) => {
+				const line = withHelpers.slice(withHelpers.lastIndexOf('\n', offset - 1) + 1, offset);
+				let quote = '';
+				for (let i = 0; i < line.length; i++) {
+					if (quote === '"' && line[i] === '\\') { i++; continue; }
+					if (line[i] === quote) { if (quote === "'" && line[i + 1] === "'") i++; else quote = ''; }
+					else if (!quote && (line[i] === '"' || line[i] === "'")) quote = line[i];
 				}
-			}
-
-			output = output + Mustache.render(
-				templateMD,
-				proxyData(hash),
-				undefined,
-				mustacheMDOptions);
+				if (!quote) return tag;
+				const helper = quote === '"' ? 'helper_yamlDouble' : 'helper_yamlSingle';
+				return `{{#${helper}}}{{{${name.trim()}}}}{{/${helper}}}`;
+			});
+			const data = { ...hash,
+				helper_yamlScalar: () => (s: string, render: (s: string) => string) => JSON.stringify(render(s)),
+				helper_yamlDouble: () => (s: string, render: (s: string) => string) => JSON.stringify(render(s)).slice(1, -1),
+				helper_yamlSingle: () => (s: string, render: (s: string) => string) => render(s).replace(/'/g, "''").replace(/\r?\n/g, ' ')
+			};
+			output = Mustache.render(yamlTemplate, proxyData(data), undefined, { escape: (s: string) => JSON.stringify(String(s)) });
 		}
-
-		return output;
+		const markdown = match ? template.slice(match[0].length) : template;
+		return output + Mustache.render(markdown, proxyData(hash), undefined, {
+			escape: (s: string) => s.replace(/[\\`*_[\]{}<>()#!|^]/g, '\\$&').replaceAll('%%', '\\%\\%').replaceAll('~~', '\\~\\~').replaceAll('==', '\\=\\=')
+		});
 	}
 
 
 	// Parse an iCalendar (.ics) file and return a fileData object compatible with
-	// createNoteFromFileData. DTSTART in .ics files is always the correct occurrence
-	// date (Outlook sets it to the specific occurrence when dragging from calendar view),
-	// so apptRecur is set to null to skip the recurring-event correction dialog.
+	// createNoteFromFileData. Series masters require explicit occurrence selection.
 	private parseIcsFile(content: string): MeetingFileData {
-		// RFC 5545 §3.1: unfold continuation lines (lines starting with whitespace)
-		const text = content
-			.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-			.replace(/\n[ \t]/g, '');
-
-		// Find first VEVENT block
-		const m = text.match(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/i);
-		if (!m) throw new TypeError('The .ics file does not contain a VEVENT block.');
-		const block = m[1];
-
-		// Parse all property lines: NAME or NAME;PARAM=VAL:value
-		const propMap = new Map<string, Array<{ value: string; params: Record<string, string> }>>();
-		for (const line of block.split('\n')) {
-			const colon = line.indexOf(':');
-			if (colon === -1) continue;
-			const keyFull = line.slice(0, colon);
-			const value = line.slice(colon + 1).trimEnd();
-			const semi = keyFull.indexOf(';');
-			const name = (semi === -1 ? keyFull : keyFull.slice(0, semi)).toUpperCase();
-			const paramStr = semi === -1 ? '' : keyFull.slice(semi + 1);
-			const params: Record<string, string> = {};
-			for (const seg of paramStr.split(';').filter(Boolean)) {
-				const eq = seg.indexOf('=');
-				if (eq !== -1) {
-					params[seg.slice(0, eq).toUpperCase()] =
-						seg.slice(eq + 1).replace(/^"(.*)"$/, '$1');
-				}
+		const text = content.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').replace(/\n[ \t]/g, '');
+		// Validate raw values before ICAL.Time can normalize an impossible date.
+		for (const line of text.split('\n')) {
+			if (!/^(DTSTART|DTEND|RECURRENCE-ID)(?:;|:)/i.test(line)) continue;
+			let quoted = false;
+			let colon = -1;
+			for (let i = 0; i < line.length; i++) {
+				if (line[i] === '"') quoted = !quoted;
+				if (line[i] === ':' && !quoted) { colon = i; break; }
 			}
-			if (!propMap.has(name)) propMap.set(name, []);
-			propMap.get(name)!.push({ value, params });
+			const raw = line.slice(colon + 1);
+			const format = raw.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD';
+			if (colon < 0 || !/^\d{8}(?:T\d{6}Z?)?$/.test(raw)
+				|| !moment.utc(raw.replace(/Z$/, ''), format, 'en', true).isValid()) throw new TypeError('The calendar file contains an invalid date: ' + raw);
 		}
-
-		const get = (name: string) => propMap.get(name)?.[0];
-
-		// Unescape RFC 5545 text values
-		const unescape = (s: string) =>
-			s.replace(/\\n/gi, '\n').replace(/\\,/g, ',')
-				.replace(/\\;/g, ';').replace(/\\\\/g, '\\');
-
-		// Parse a date/time property to a moment.
-		// UTC times end with Z; TZID times are parsed as local (assumes the
-		// computer's timezone matches the event's timezone, which is the common case).
-		const parseDT = (prop: { value: string; params: Record<string, string> } | undefined)
-			: moment.Moment | undefined => {
-			if (!prop) return undefined;
-			const v = prop.value.replace(/\s/g, '');
-			if (v.endsWith('Z')) {
-				const clean = v.slice(0, -1);
-				return moment.utc(clean, clean.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
-			}
-			return moment(v, v.includes('T') ? 'YYYYMMDDTHHmmss' : 'YYYYMMDD');
-		};
-
-		// Parse attendees (ATTENDEE;CN=...:mailto:email)
+		const calendar = new ICAL.Component(ICAL.parse(text));
+		if (calendar.name !== 'vcalendar') throw new TypeError('The file is not an iCalendar document.');
+		const events = calendar.getAllSubcomponents('vevent');
+		if (events.length !== 1) throw new TypeError('The .ics file must contain exactly one event. Export the individual meeting or occurrence.');
+		const event = events[0];
+		for (const name of ['dtstart', 'dtend', 'duration', 'summary', 'recurrence-id']) {
+			if (event.getAllProperties(name).length > 1) throw new TypeError('The calendar file contains duplicate ' + name + ' fields.');
+		}
+		const startProperty = event.getFirstProperty('dtstart');
+		const summary = event.getFirstPropertyValue('summary');
+		if (typeof summary !== 'string') throw new TypeError('The .ics file is missing a SUMMARY (event title).');
+		if (!startProperty) throw new TypeError('The .ics file is missing a DTSTART (start date).');
+		const startTime = startProperty.getFirstValue();
+		if (!(startTime instanceof ICAL.Time)) throw new TypeError('The calendar start date is invalid.');
+		const wall = (t: IcalTime): moment.Moment => moment.utc([t.year, t.month - 1, t.day, t.hour, t.minute, t.second]);
+		const clock = this.getIcsClock(calendar, startProperty, startTime);
+		const startWall = wall(startTime);
+		const start = clock.fromWall(startWall);
+		const endProperty = event.getFirstProperty('dtend');
+		const durationProperty = event.getFirstProperty('duration');
+		if (endProperty && durationProperty) throw new TypeError('The calendar file must not contain both DTEND and DURATION.');
+		let end: moment.Moment;
+		let calendarDays = startTime.isDate ? 1 : 0;
+		let seconds = 0;
+		if (endProperty) {
+			const endTime = endProperty.getFirstValue();
+			if (!(endTime instanceof ICAL.Time) || endTime.isDate !== startTime.isDate) throw new TypeError('The calendar start and end must use the same date type.');
+			end = this.getIcsClock(calendar, endProperty, endTime).fromWall(wall(endTime));
+			if (startTime.isDate) calendarDays = wall(endTime).diff(startWall, 'days');
+			else seconds = end.diff(start, 'seconds');
+		} else if (durationProperty) {
+			const duration = durationProperty.getFirstValue();
+			if (!(duration instanceof ICAL.Duration) || duration.isNegative || duration.toSeconds() <= 0) throw new TypeError('The calendar duration must be positive.');
+			calendarDays = duration.weeks * 7 + duration.days;
+			seconds = duration.hours * 3600 + duration.minutes * 60 + duration.seconds;
+			if (startTime.isDate && seconds) throw new TypeError('An all-day duration must use whole days or weeks.');
+			end = clock.fromWall(startWall.clone().add(calendarDays, 'days')).add(seconds, 'seconds');
+		} else end = clock.fromWall(startWall.clone().add(calendarDays, 'days'));
+		if (!start.isValid() || !end.isValid() || end.isBefore(start) || (startTime.isDate && !end.isAfter(start))) throw new TypeError('The calendar end date must not precede its start date.');
 		const recipients: Array<{ name: string; email: string }> = [];
-		for (const att of propMap.get('ATTENDEE') ?? []) {
-			const emailM = att.value.match(/mailto:(.+)/i);
-			if (!emailM) continue;
-			const email = emailM[1].trim();
-			const cn = att.params['CN'];
-			recipients.push({ name: cn ? unescape(cn) : email, email });
+		for (const attendee of event.getAllProperties('attendee')) {
+			const address = attendee.getFirstValue();
+			if (typeof address !== 'string' || !/^mailto:/i.test(address)) continue;
+			const email = address.replace(/^mailto:/i, '');
+			const name = attendee.getParameter('cn');
+			recipients.push({ name: typeof name === 'string' ? name : email, email });
 		}
-
-		const summaryProp = get('SUMMARY');
-		const dtstart = get('DTSTART');
-		const dtend = get('DTEND');
-		const locationProp = get('LOCATION');
-		const descProp = get('DESCRIPTION');
-
-		if (!summaryProp) throw new TypeError('The .ics file is missing a SUMMARY (event title).');
-		if (!dtstart) throw new TypeError('The .ics file is missing a DTSTART (start date).');
-
+		// DTSTART of a series master is not evidence of which occurrence was dropped.
+		const recurring = !event.hasProperty('recurrence-id') && (event.hasProperty('rrule') || event.hasProperty('rdate'));
+		for (const rule of event.getAllProperties('rrule')) rule.getFirstValue();
+		const location = event.getFirstPropertyValue('location');
+		const body = event.getFirstPropertyValue('description');
 		return {
-			dataType: 'msg',                  // satisfies createMeetingNote validation path
-			messageClass: 'IPM.Appointment',
-			subject: unescape(summaryProp.value),
-			apptStartWhole: parseDT(dtstart)?.toISOString(),
-			apptEndWhole: parseDT(dtend)?.toISOString(),
-			apptLocation: locationProp ? unescape(locationProp.value) : '',
-			body: descProp ? unescape(descProp.value) : '',
-			recipients,
-			apptRecur: null,  // DTSTART already has the correct occurrence date
+			dataType: 'msg', messageClass: 'IPM.Appointment', subject: summary,
+			apptStartWhole: start.toISOString(), apptEndWhole: end.toISOString(),
+			apptLocation: typeof location === 'string' ? location : '', body: typeof body === 'string' ? body : '',
+			recipients, apptRecur: null, needsOccurrenceDate: recurring,
+			icsOccurrence: recurring ? { clock, startWall, calendarDays, seconds } : undefined
 		};
 	}
 
@@ -463,82 +432,60 @@ export default class OutlookMeetingNotes extends Plugin {
 	private async correctRecurringOccurrenceDate(fileData: MeetingFileData, dragText = ''): Promise<boolean> {
 		const apptRecur = fileData.apptRecur;
 		if (!apptRecur?.recurrencePattern) return true;
-
 		const rp = apptRecur.recurrencePattern;
-		const apptStart = moment(fileData.apptStartWhole);
-		if (!apptStart.isValid()) return true;
-
-		// Early-exit: if apptStartWhole is already on a different local calendar day
-		// than the series start, Outlook stored the correct occurrence — leave it alone.
-		//
-		// Key invariant: dateFromRecurMinutes(startDate) always produces a moment
-		// whose UTC date equals the series-start LOCAL calendar date (midnight-local
-		// is encoded as an offset from midnight-UTC-1601, so the UTC date = local date).
-		// Therefore: compare apptStart.local() (the event's local date) with
-		// firstOccDate.utc() (which carries the series-start calendar date).
-		//
-		// The old ">= 24 h diff" check broke for UTC−4/UTC−5 evening events: an event
-		// at 21:30 EDT stores apptStartWhole as ~01:30 UTC the next day, making the
-		// diff ≥ 24 h even though both represent the same local calendar day.
-		const firstOccDate = this.dateFromRecurMinutes(rp.startDate);
-		if (apptStart.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD')) return true;
-
-		let corrected: moment.Moment | null = null;
-
-		// Helper: given a chosen local date, produce the corrected occurrence moment.
-		// We preserve the original time-of-day from apptStartWhole (in local timezone)
-		// and only swap the calendar date, so the resulting UTC value is correct
-		// regardless of whether the event was created in a different timezone.
-		const withDate = (d: moment.Moment): moment.Moment =>
-			apptStart.clone().year(d.year()).month(d.month()).date(d.date());
-
-		// Try PidLidGlobalObjectId first — most reliable source for native Outlook events.
-		const occDateFromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
-		if (occDateFromId) {
-			corrected = withDate(occDateFromId);
-		} else {
-			// Try to parse the occurrence date from the drag text that Outlook Classic
-			// puts in the DataTransfer. Only trust it when the parsed date is DIFFERENT
-			// from the series start — for Google Calendar recurring events, Outlook copies
-			// the series-master text for every occurrence, so the drag text always carries
-			// the series start date and gives us no new information.
-			const parsedDate = dragText ? this.parseDateFromDragText(dragText) : null;
-			const parsedIsUseful = parsedDate
-				&& parsedDate.local().format('YYYY-MM-DD') !== firstOccDate.utc().format('YYYY-MM-DD');
-			if (parsedIsUseful) {
-				corrected = withDate(parsedDate);
-			} else {
-				// Could not extract the date automatically — show a date-picker dialog.
-				// Pre-fill with the occurrence nearest to today (rather than the series
-				// start) because users typically drag an upcoming or recent meeting.
-				// For a yearly event in March 2026, this correctly lands on 2026-07-26
-				// instead of the series-start 2021-07-26 that would otherwise appear.
-				// Falls back to the series start if the recurrence type is unrecognised.
-				const closestOcc = this.findClosestOccurrence(apptRecur, apptStart, moment());
-				const suggestedStr = closestOcc
-					? closestOcc.local().format('YYYY-MM-DD')
-					: apptStart.local().format('YYYY-MM-DD');
-
-				const userDateStr = await new Promise<string | null>((resolve) => {
-					new OccurrenceDateModal(this.app, suggestedStr, resolve).open();
-				});
-
-				if (!userDateStr) return false; // user cancelled
-
-				const userDate = moment(userDateStr, 'YYYY-MM-DD', true);
-				if (!userDate.isValid()) return false;
-				corrected = withDate(userDate);
+		const apptStart = this.parseMeetingDate(fileData.apptStartWhole);
+		const apptEnd = this.parseMeetingDate(fileData.apptEndWhole);
+		if (!apptStart.isValid()) throw new TypeError('The meeting has no valid start date.');
+		const clock = this.getMeetingClock(fileData);
+		const startWall = clock.toWall(apptStart);
+		const firstDate = this.dateFromRecurMinutes(rp.startDate).utc();
+		if (!firstDate.isValid()) throw new TypeError('The recurring series has no valid start date.');
+		// Compare calendar dates in the MEETING's zone, not the computer's zone.
+		if (!startWall.isSame(firstDate, 'day')) return true;
+		const withDate = (date: moment.Moment): moment.Moment => moment.utc([
+			date.year(), date.month(), date.date(), startWall.hour(), startWall.minute(), startWall.second(), startWall.millisecond()
+		]);
+		const fromId = this.getOccurrenceDateFromGlobalId(fileData.globalAppointmentID);
+		let chosen: moment.Moment;
+		if (fromId) chosen = withDate(fromId);
+		else {
+			const parsed = dragText ? this.parseDateFromDragText(dragText) : null;
+			// Outlook's text is displayed in the computer's zone. Keep its actual instant.
+			if (parsed && !clock.toWall(parsed).isSame(firstDate, 'day')) chosen = clock.toWall(parsed);
+			else {
+				const now = moment();
+				const closest = this.findClosestOccurrence(apptRecur, startWall, clock.toWall(now), d => clock.fromWall(d).diff(now));
+				// The picker shows a date in the user's local calendar, just like Outlook.
+				const suggestion = closest ? clock.fromWall(closest).local().locale('en').format('YYYY-MM-DD') : '';
+				const selected = await new Promise<string | null>(resolve => new OccurrenceDateModal(this.app, suggestion, resolve).open());
+				if (!selected) return false;
+				const date = moment(selected, 'YYYY-MM-DD', 'en', true);
+				if (!date.isValid()) return false;
+				if (closest && selected === suggestion) chosen = closest;
+				else {
+					// Find the meeting-zone date which falls on the selected local date.
+					const candidate = withDate(date);
+					chosen = [-1, 0, 1].map(n => candidate.clone().add(n, 'days')).find(d => clock.fromWall(d).local().isSame(date, 'day')) ?? candidate;
+				}
 			}
 		}
-
-		if (!corrected) return true;
-
-		const endStart = moment(fileData.apptEndWhole);
-		if (endStart.isValid()) {
-			const duration = endStart.diff(apptStart, 'minutes');
-			fileData.apptEndWhole = corrected.clone().add(duration, 'minutes').toISOString();
+		const exceptions = apptRecur.exceptionInfo ?? [];
+		const exception = (fromId ? exceptions.find(e => this.dateFromRecurMinutes(e.originalStartTime).utc().isSame(withDate(fromId), 'day')) : undefined)
+			?? exceptions.find(e => this.dateFromRecurMinutes(e.startDateTime).utc().isSame(chosen, 'day'));
+		if (exception) {
+			const start = clock.fromWall(this.dateFromRecurMinutes(exception.startDateTime).utc());
+			const end = clock.fromWall(this.dateFromRecurMinutes(exception.endDateTime).utc());
+			if (!start.isValid() || !end.isValid() || end.isBefore(start)) throw new TypeError('The modified occurrence has invalid dates.');
+			fileData.apptStartWhole = start.toISOString();
+			fileData.apptEndWhole = end.toISOString();
+			return true;
 		}
-		fileData.apptStartWhole = corrected.toISOString();
+		const endWall = apptEnd.isValid() ? clock.toWall(apptEnd) : startWall;
+		const wallDuration = Number.isFinite(apptRecur.startTimeOffset) && Number.isFinite(apptRecur.endTimeOffset)
+			? apptRecur.endTimeOffset - apptRecur.startTimeOffset : endWall.diff(startWall, 'minutes');
+		if (wallDuration < 0) throw new TypeError('The meeting ends before it starts.');
+		fileData.apptStartWhole = clock.fromWall(chosen).toISOString();
+		fileData.apptEndWhole = clock.fromWall(chosen.clone().add(wallDuration, 'minutes')).toISOString();
 		return true;
 	}
 
@@ -546,12 +493,13 @@ export default class OutlookMeetingNotes extends Plugin {
 	// Bytes 16-17 = year (big-endian), 18 = month, 19 = day.
 	// Returns null when the bytes are all zero (series master, not occurrence-specific).
 	private getOccurrenceDateFromGlobalId(hexStr: string | undefined): moment.Moment | null {
-		if (!hexStr || hexStr.length < 40) return null;
-		const year = (parseInt(hexStr.substring(32, 34), 16) << 8) | parseInt(hexStr.substring(34, 36), 16);
-		const month = parseInt(hexStr.substring(36, 38), 16);
-		const day = parseInt(hexStr.substring(38, 40), 16);
-		if (year === 0 || month === 0 || day === 0) return null;
-		return moment({ year, month: month - 1, day }); // month is 0-indexed in moment
+		if (!hexStr || hexStr.length < 40 || hexStr.length % 2 || !/^[\da-f]+$/i.test(hexStr)) return null;
+		const year = parseInt(hexStr.slice(32, 36), 16);
+		const month = parseInt(hexStr.slice(36, 38), 16);
+		const day = parseInt(hexStr.slice(38, 40), 16);
+		if (!year || !month || !day) return null;
+		const date = moment([year, month - 1, day]);
+		return date.isValid() ? date : null;
 	}
 
 	// Try to extract the occurrence start date from the plain-text representation
@@ -561,67 +509,28 @@ export default class OutlookMeetingNotes extends Plugin {
 	//   French:  "Début :  mercredi 15 octobre 2025 21:30"
 	// Returns null if no parseable date is found (caller should fall back to dialog).
 	private parseDateFromDragText(text: string): moment.Moment | null {
-		// Locate the Start / Début line. Handles:
-		//   • space before colon  ("Début :")
-		//   • tab between colon and value
-		//   • all keyword variants (Start / Début / Debut / Begin)
-		const lineMatch = text.match(/^(?:start|d[eé]but|begin)\s*:\s*(.+)$/im);
-		if (!lineMatch) return null;
-		const rawDate = lineMatch[1].trim();
-		if (!rawDate) return null;
-
-		// locale → strict-mode formats to attempt
-		const localeFormats: Array<[string, string[]]> = [
-			['fr', [
-				'dddd D MMMM YYYY HH:mm',	// mercredi 15 octobre 2025 21:30
-				'dddd D MMMM YYYY H:mm',
-				'dddd D MMMM YYYY',
-				'D/M/YYYY HH:mm',
-				'D/M/YYYY H:mm',
-			]],
-			['fr-ca', [
-				'dddd D MMMM YYYY HH:mm',
-				'dddd D MMMM YYYY H:mm',
-				'dddd D MMMM YYYY',
-			]],
-			['en', [
-				'dddd, MMMM D, YYYY h:mm A',	// Wednesday, October 15, 2025 9:30 PM
-				'dddd, MMMM D, YYYY HH:mm',
-				'dddd MMMM D, YYYY h:mm A',
-				'dddd MMMM D YYYY h:mm A',
-				'M/D/YYYY h:mm A',
-				'M/D/YYYY HH:mm',
-			]],
-		];
-
-		const savedLocale = moment.locale();
-		try {
-			for (const [locale, formats] of localeFormats) {
-				moment.locale(locale);
-				for (const fmt of formats) {
-					const m = moment(rawDate, fmt, locale, true);
-					if (m.isValid()) return m;
-				}
-			}
-			// Last resort: let moment parse without strict mode.
-			// Guard against garbage: require a plausible year range.
-			moment.locale(savedLocale);
-			const loose = moment(rawDate);
-			if (loose.isValid() && loose.year() >= 2000 && loose.year() <= 2100) return loose;
-		} finally {
-			moment.locale(savedLocale);
-		}
-		return null;
+		const match = text.match(/^[\t ]*(start|d[eé]but|begin)[\t ]*:[\t ]*(.+)$/im);
+		if (!match) return null;
+		const raw = match[2].trim().replace(/[\u00a0\u202f]/g, ' ');
+		const french = /^d[eé]but$/i.test(match[1]);
+		const englishFormats = ['dddd, MMMM D, YYYY h:mm A', 'dddd, MMMM D, YYYY HH:mm', 'dddd MMMM D, YYYY h:mm A', 'dddd MMMM D YYYY h:mm A', 'MMMM D, YYYY h:mm A', 'M/D/YYYY h:mm A', 'MM/DD/YYYY h:mm A', 'M/D/YYYY HH:mm', 'MM/DD/YYYY HH:mm'];
+		const frenchFormats = ['dddd D MMMM YYYY HH:mm', 'dddd D MMMM YYYY H:mm', 'dddd D MMMM YYYY', 'D/M/YYYY HH:mm', 'DD/MM/YYYY HH:mm', 'D/M/YYYY H:mm'];
+		const date = moment(raw, french ? frenchFormats : englishFormats, french ? 'fr' : 'en', true);
+		if (date.isValid()) return date;
+		const iso = moment(raw, moment.ISO_8601, true);
+		return iso.isValid() ? iso : null;
 	}
 
 	// Return the nth (1-4, or 5 = last) weekday matching dayOfWeekBits within the
 	// given month, at baseTime's time-of-day. Used for "MonthNth" recurrence patterns
 	// (e.g. "the fourth Wednesday of every month"), where the day-of-month shifts from
 	// month to month and cannot be found by simply adding months to the first occurrence.
-	// Returns null if the month doesn't have an nth match (e.g. no 5th Monday).
+	// Returns null for an invalid weekday mask or occurrence number.
 	private nthWeekdayOfMonth(year: number, month0: number, dayOfWeekBits: number, n: number, baseTime: moment.Moment): moment.Moment | null {
+		if (!Number.isInteger(n) || n < 1 || n > 5
+			|| !Number.isInteger(dayOfWeekBits) || dayOfWeekBits < 1 || dayOfWeekBits > 127) return null;
 		const matches: moment.Moment[] = [];
-		const cursor = moment({ year, month: month0, day: 1 });
+		const cursor = baseTime.clone().startOf('day').date(1).year(year).month(month0);
 		const daysInMonth = cursor.daysInMonth();
 		for (let d = 1; d <= daysInMonth; d++) {
 			const day = cursor.clone().date(d);
@@ -630,7 +539,7 @@ export default class OutlookMeetingNotes extends Plugin {
 		if (matches.length === 0) return null;
 		const picked = n === 5 ? matches[matches.length - 1] : matches[n - 1];
 		if (!picked) return null;
-		return picked.add(baseTime.hours() * 60 + baseTime.minutes(), 'minutes');
+		return picked.set({ hour: baseTime.hour(), minute: baseTime.minute(), second: baseTime.second(), millisecond: baseTime.millisecond() });
 	}
 
 	// Return the occurrence of a recurring series closest to `today`.
@@ -639,105 +548,215 @@ export default class OutlookMeetingNotes extends Plugin {
 	// arises when startDate (always midnight UTC) is converted to local time.
 	// Respects the series end date so past-ended or future series return the
 	// closest valid occurrence rather than falling back to the series start.
-	private findClosestOccurrence(apptRecur: AppointmentRecur, baseTime: moment.Moment, today: moment.Moment): moment.Moment | null {
+	private findClosestOccurrence(apptRecur: AppointmentRecur, baseTime: moment.Moment, today: moment.Moment, distance?: (date: moment.Moment) => number): moment.Moment | null {
 		try {
 			const rp = apptRecur.recurrencePattern;
-
-			// Local-time midnight of baseTime, used for day-level period arithmetic.
-			const firstMidnight = baseTime.clone().startOf('day');
-
-			// Determine the last valid occurrence date if the series has an end date.
-			// endDate is stored in the same minutes-since-1601 format as startDate.
-			// Read the encoded calendar date in UTC, then keep that date at local midnight.
-			// A normal UTC-to-local conversion can move it to the previous day.
-			// A value of 0x5AE980DF (1525252319) is Outlook's sentinel for "no end date".
-			const OUTLOOK_NO_END = 0x5AE980DF;
-			const lastOccDate: moment.Moment | null =
-				rp.endDate && rp.endDate !== OUTLOOK_NO_END
-					? this.dateFromRecurMinutes(rp.endDate).utc().local(true)
-					: null;
-
-			const candidates: moment.Moment[] = [];
 			const freq: number = rp.recurFrequency;
 			const period: number = rp.period;
+			if (!baseTime.isValid() || !today.isValid() || !Number.isInteger(period) || period < 1) return null;
+			// Unsupported calendars must not silently use Gregorian arithmetic.
+			if (![0, 1, 2, 9, 10, 11, 12].includes(rp.calendarType ?? 0)
+				|| ![PatternType.Day, PatternType.Week, PatternType.Month, PatternType.MonthNth, PatternType.MonthEnd].includes(rp.patternType)) return null;
+			if (rp.patternType === PatternType.MonthNth && !rp.patternTypeMonthNth) return null;
 
-			// Anchor for candidate generation:
-			// - Future series (baseTime > today): use series start so the first occurrence is always a candidate.
-			// - Past series (lastOccDate < today): use lastOccDate so candidates land inside the series range.
-			// - Normal: use today.
-			const anchor = today.isBefore(firstMidnight)
-				? firstMidnight
+			const firstMidnight = baseTime.clone().startOf('day');
+			const recurrenceDate = (n: number): moment.Moment => {
+				const date = this.dateFromRecurMinutes(n).utc();
+				return baseTime.isUTC() ? date : date.local(true);
+			};
+			// Recurrence dates encode local calendar dates, not UTC instants.
+			const OUTLOOK_NO_END = 0x5AE980DF;
+			const lastOccDate = rp.endDate && rp.endDate !== OUTLOOK_NO_END
+				? recurrenceDate(rp.endDate) : null;
+			if (lastOccDate && (!lastOccDate.isValid() || lastOccDate.isBefore(firstMidnight, 'day'))) return null;
+			const inRange = (d: moment.Moment): boolean => d.isValid()
+				&& !d.isBefore(firstMidnight, 'day') && (!lastOccDate || !d.isAfter(lastOccDate, 'day'));
+			const dateKey = (d: moment.Moment): number => d.year() * 10000 + (d.month() + 1) * 100 + d.date();
+			const excluded = new Set((rp.deletedInstanceDates ?? []).map(d =>
+				dateKey(recurrenceDate(d))));
+			const exceptions = apptRecur.exceptionInfo ?? [];
+			for (const e of exceptions)
+				excluded.add(dateKey(recurrenceDate(e.originalStartTime)));
+			// Search past consecutive deletions as well as the adjacent periods.
+			const radius = excluded.size + 1;
+			const candidates: moment.Moment[] = [];
+			const atTime = (d: moment.Moment): moment.Moment => d.set({
+				hour: baseTime.hour(), minute: baseTime.minute(),
+				second: baseTime.second(), millisecond: baseTime.millisecond()
+			});
+			const anchor = today.isBefore(firstMidnight) ? firstMidnight
 				: (lastOccDate && today.isAfter(lastOccDate, 'day') ? lastOccDate : today);
 
-			if (freq === 8202) { // Daily (period is in minutes)
-				const periodDays = Math.max(1, Math.round(period / 1440));
-				const n = Math.round(anchor.diff(firstMidnight, 'days') / periodDays);
-				for (let i = Math.max(0, n - 1); i <= n + 2; i++)
+			if (freq === 8202 && rp.patternType !== PatternType.Week) { // Daily: period is in minutes.
+				if (period % 1440 !== 0) return null;
+				const periodDays = period / 1440;
+				const n = Math.floor(anchor.diff(firstMidnight, 'days') / periodDays);
+				for (let i = Math.max(0, n - radius); i <= n + radius + 1; i++)
 					candidates.push(baseTime.clone().add(i * periodDays, 'days'));
-			} else if (freq === 8203) { // Weekly (period is in weeks)
-				const dayBits: number = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << baseTime.day());
-				const firstWeekSun = firstMidnight.clone().startOf('week');
-				const n = Math.round(anchor.diff(firstWeekSun, 'weeks') / period);
-				for (let w = Math.max(0, n - 1); w <= n + 2; w++) {
-					const weekBase = firstWeekSun.clone().add(w * period, 'weeks');
+			} else if (freq === 8203 || (freq === 8202 && rp.patternType === PatternType.Week)) { // Weekly: use Outlook's week start, independent of locale.
+				const dayBits = rp.patternTypeWeek?.dayOfWeekBits ?? (1 << baseTime.day());
+				const firstDOW = rp.firstDOW ?? 0;
+				if (!Number.isInteger(firstDOW) || firstDOW < 0 || firstDOW > 6
+					|| !Number.isInteger(dayBits) || dayBits < 1 || dayBits > 127) return null;
+				const firstWeek = firstMidnight.clone().subtract((firstMidnight.day() - firstDOW + 7) % 7, 'days');
+				const n = Math.floor(anchor.diff(firstWeek, 'weeks') / period);
+				for (let w = Math.max(0, n - radius); w <= n + radius + 1; w++) {
+					const weekBase = firstWeek.clone().add(w * period, 'weeks');
 					for (let d = 0; d < 7; d++)
-						if (dayBits & (1 << d))
-							candidates.push(weekBase.clone().add(d, 'days')
-								.add(baseTime.hours() * 60 + baseTime.minutes(), 'minutes'));
+						if (dayBits & (1 << ((firstDOW + d) % 7)))
+							candidates.push(atTime(weekBase.clone().add(d, 'days')));
 				}
-			} else if (freq === 8204) { // Monthly (period is in months)
-				const n = Math.round(Math.max(0, anchor.diff(firstMidnight, 'months')) / period);
-				if (rp.patternType === PatternType.MonthNth && rp.patternTypeMonthNth) {
-					// e.g. "the fourth Wednesday of every month" — the day-of-month
-					// shifts each month, so it must be recomputed, not just offset.
-					const { dayOfWeekBits, n: nth } = rp.patternTypeMonthNth;
-					for (let i = Math.max(0, n - 1); i <= n + 2; i++) {
-						const monthStart = firstMidnight.clone().add(i * period, 'months');
-						const occ = this.nthWeekdayOfMonth(monthStart.year(), monthStart.month(), dayOfWeekBits, nth, baseTime);
+			} else if (freq === 8204 || freq === 8205) { // Monthly/yearly: period is in months.
+				const firstMonth = firstMidnight.clone().startOf('month');
+				const n = Math.floor(anchor.diff(firstMonth, 'months') / period);
+				const day = rp.patternTypeMonth?.day ?? baseTime.date();
+				if (!Number.isInteger(day) || day < 1 || day > 31) return null;
+				for (let i = Math.max(0, n - radius); i <= n + radius + 1; i++) {
+					const month = firstMonth.clone().add(i * period, 'months');
+					if (rp.patternType === PatternType.MonthNth && rp.patternTypeMonthNth) {
+						const { dayOfWeekBits, n: nth } = rp.patternTypeMonthNth;
+						const occ = this.nthWeekdayOfMonth(month.year(), month.month(), dayOfWeekBits, nth, baseTime);
 						if (occ) candidates.push(occ);
+					} else {
+						const monthDay = rp.patternType === PatternType.MonthEnd ? month.daysInMonth() : Math.min(day, month.daysInMonth());
+						candidates.push(atTime(month.date(monthDay)));
 					}
-				} else {
-					for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-						candidates.push(baseTime.clone().add(i * period, 'months'));
-				}
-			} else if (freq === 8205) { // Yearly
-				const n = Math.max(0, anchor.diff(firstMidnight, 'years'));
-				if (rp.patternType === PatternType.MonthNth && rp.patternTypeMonthNth) {
-					// e.g. "the fourth Wednesday of March every year".
-					const { dayOfWeekBits, n: nth } = rp.patternTypeMonthNth;
-					const month0 = firstMidnight.month();
-					for (let i = Math.max(0, n - 1); i <= n + 2; i++) {
-						const occ = this.nthWeekdayOfMonth(firstMidnight.year() + i, month0, dayOfWeekBits, nth, baseTime);
-						if (occ) candidates.push(occ);
-					}
-				} else {
-					for (let i = Math.max(0, n - 1); i <= n + 2; i++)
-						candidates.push(baseTime.clone().add(i, 'years'));
 				}
 			} else {
 				return null;
 			}
 
-			// Filter: must be on or after the series start, and on or before the end date.
-			const valid = candidates.filter(c =>
-				!c.isBefore(baseTime, 'day') &&
-				(lastOccDate === null || !c.isAfter(lastOccDate, 'day'))
-			);
-
-			// If no candidates survive (e.g. series ended before today), clamp to the
-			// last occurrence: pick the candidate closest to today that is still within range.
-			const pool = valid.length > 0 ? valid : candidates.filter(c =>
-				!c.isBefore(baseTime, 'day')
-			);
-			if (pool.length === 0) return baseTime;
-			return pool.reduce((best, c) =>
-				Math.abs(c.diff(today)) < Math.abs(best.diff(today)) ? c : best
+			const valid = candidates.filter(c => inRange(c) && !excluded.has(dateKey(c)));
+			// A moved exception may fall beyond the nominal first/last date. Its
+			// original slot determines membership in the series.
+			for (const e of exceptions) {
+				const original = recurrenceDate(e.originalStartTime);
+				const moved = recurrenceDate(e.startDateTime);
+				if (inRange(original) && moved.isValid()) valid.push(moved);
+			}
+			if (valid.length === 0) return null;
+			return valid.reduce((best, c) =>
+				Math.abs(distance ? distance(c) : c.diff(today)) < Math.abs(distance ? distance(best) : best.diff(today)) ? c : best
 			);
 		} catch {
 			return null;
 		}
 	}
 
+
+	private parseMeetingDate(value: unknown): moment.Moment {
+		return typeof value === 'string' && value.trim()
+			? moment(value, [moment.ISO_8601, moment.RFC_2822], true) : moment.invalid();
+	}
+
+	private sanitizeNoteName(value: string): string {
+		const forbidden = /[\u0000-\u001f\u007f<>:"/\\|?*]/g;
+		const replacement = this.settings.invalidFilenameCharReplacement.replace(forbidden, '');
+		let name = value.replace(forbidden, () => replacement).replace(/[ .]+$/, '').trim();
+		if (!name || name === '.' || name === '..') name = 'Meeting';
+		if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name)) name = '_' + name;
+		// Leave room for the extension and avoid splitting a Unicode character.
+		while (name.length > 240) name = Array.from(name).slice(0, -1).join('');
+		return name.replace(/[ .]+$/, '') || 'Meeting';
+	}
+
+	private wallToInstant(wall: moment.Moment, offsetAt: (stamp: number) => number): moment.Moment {
+		const stamp = wall.valueOf();
+		const offsets = new Set([-36, 0, 36].map(h => offsetAt(stamp + h * 3600000)));
+		const candidates = [...offsets].map(offset => stamp - offset * 60000).sort((a, b) => a - b);
+		const exact = candidates.find(candidate => candidate + offsetAt(candidate) * 60000 === stamp);
+		if (exact !== undefined) return moment.utc(exact); // First instance of a repeated wall time.
+		// RFC 5545: a time in a spring gap uses the offset before the gap.
+		const after = candidates.filter(candidate => candidate + offsetAt(candidate) * 60000 > stamp);
+		if (!after.length) throw new TypeError('The meeting time cannot be resolved in its time zone.');
+		return moment.utc(after.reduce((a, b) => a + offsetAt(a) * 60000 < b + offsetAt(b) * 60000 ? a : b));
+	}
+
+	private getMeetingClock(data?: MeetingFileData, zoneName?: string): MeetingClock {
+		const rules = data?.apptTZDefRecur?.rules ?? [];
+		const zoneStruct = data?.timeZoneStruct;
+		if (rules.length || zoneStruct) {
+			const offsetAt = (stamp: number): number => {
+				const eligible = rules.filter(r => !r.start || Date.parse(r.start) <= stamp)
+					.sort((a, b) => (a.start ? Date.parse(a.start) : -Infinity) - (b.start ? Date.parse(b.start) : -Infinity));
+				const rule = eligible[eligible.length - 1] ?? zoneStruct ?? rules[0];
+				if (!rule || ![rule.bias, rule.standardBias, rule.daylightBias].every(Number.isFinite)) throw new TypeError('The meeting contains invalid time zone data.');
+				const standard = -rule.bias - rule.standardBias;
+				const daylight = -rule.bias - rule.daylightBias;
+				if (!rule.daylightDate.month || !rule.standardDate.month || standard === daylight) return standard;
+				const year = new Date(stamp).getUTCFullYear();
+				const transition = (t: OutlookZoneTransition, previousOffset: number): number => {
+					const y = t.year || year;
+					let day = t.day;
+					if (!t.year) {
+						const firstDOW = new Date(Date.UTC(y, t.month - 1, 1)).getUTCDay();
+						day = 1 + (t.dayOfWeek - firstDOW + 7) % 7 + (t.day - 1) * 7;
+						if (day > new Date(Date.UTC(y, t.month, 0)).getUTCDate()) day -= 7;
+					}
+					return Date.UTC(y, t.month - 1, day, t.hour, t.minute) - previousOffset * 60000;
+				};
+				const begins = transition(rule.daylightDate, standard);
+				const ends = transition(rule.standardDate, daylight);
+				return (begins < ends ? stamp >= begins && stamp < ends : stamp >= begins || stamp < ends) ? daylight : standard;
+			};
+			return {
+				toWall: instant => moment.utc(instant.valueOf() + offsetAt(instant.valueOf()) * 60000),
+				fromWall: wall => this.wallToInstant(wall, offsetAt)
+			};
+		}
+		const name = zoneName ?? data?.apptTZDefRecur?.keyName ?? data?.timeZoneDesc;
+		if (!name) return { toWall: instant => instant.clone().local().utc(true), fromWall: wall => wall.clone().local(true) };
+		const zone = findIana(name, '001')[0] ?? name;
+		let formatter: Intl.DateTimeFormat;
+		try {
+			formatter = new Intl.DateTimeFormat('en-US-u-ca-gregory-nu-latn', {
+				timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+				hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+			});
+		} catch { throw new TypeError('Unsupported meeting time zone: ' + name + '. Export the occurrence with its time zone definition.'); }
+		const toWall = (instant: moment.Moment): moment.Moment => {
+			const parts = Object.fromEntries(formatter.formatToParts(instant.toDate()).map(p => [p.type, p.value]));
+			return moment.utc([+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second, instant.millisecond()]);
+		};
+		const offsetAt = (stamp: number): number => (toWall(moment.utc(stamp)).valueOf() - stamp) / 60000;
+		return { toWall, fromWall: wall => this.wallToInstant(wall, offsetAt) };
+	}
+
+	private getIcsClock(calendar: IcalComponent, property: IcalProperty, time: IcalTime): MeetingClock {
+		const tzid = property.getParameter('tzid');
+		if (time.isDate && tzid) throw new TypeError('An all-day calendar date must not have a time zone parameter.');
+		if (time.zone === ICAL.Timezone.utcTimezone) return this.getMeetingClock(undefined, 'UTC');
+		if (!tzid) return this.getMeetingClock();
+		if (typeof tzid !== 'string') throw new TypeError('The calendar time zone is invalid.');
+		const embedded = calendar.getTimeZoneByID(tzid);
+		if (!embedded) return this.getMeetingClock(undefined, tzid);
+		return {
+			toWall: instant => {
+				const t = ICAL.Time.fromJSDate(instant.toDate(), true).convertToZone(embedded);
+				return moment.utc([t.year, t.month - 1, t.day, t.hour, t.minute, t.second]);
+			},
+			fromWall: wall => moment.utc(new ICAL.Time({
+				year: wall.year(), month: wall.month() + 1, day: wall.date(),
+				hour: wall.hour(), minute: wall.minute(), second: wall.second(), isDate: false
+			}, embedded).toUnixTime() * 1000)
+		};
+	}
+
+	private async correctIcsOccurrenceDate(fileData: MeetingFileData): Promise<boolean> {
+		const occurrence = fileData.icsOccurrence;
+		if (!occurrence) throw new TypeError('The recurring calendar file has no usable occurrence information.');
+		const selected = await new Promise<string | null>(resolve => new OccurrenceDateModal(this.app, '', resolve).open());
+		if (!selected) return false;
+		const date = moment(selected, 'YYYY-MM-DD', 'en', true);
+		if (!date.isValid()) return false;
+		const { clock, startWall, calendarDays, seconds } = occurrence;
+		const candidate = moment.utc([date.year(), date.month(), date.date(), startWall.hour(), startWall.minute(), startWall.second()]);
+		const chosen = [-1, 0, 1].map(n => candidate.clone().add(n, 'days')).find(d => clock.fromWall(d).local().isSame(date, 'day'));
+		if (!chosen) throw new TypeError('This occurrence date cannot be resolved in the meeting time zone.');
+		fileData.apptStartWhole = clock.fromWall(chosen).toISOString();
+		fileData.apptEndWhole = clock.fromWall(chosen.clone().add(calendarDays, 'days')).add(seconds, 'seconds').toISOString();
+		return true;
+	}
 }
 
 // Modal shown when the specific occurrence date cannot be determined from the .msg file.
@@ -763,12 +782,11 @@ class OccurrenceDateModal extends Modal {
 		const { contentEl } = this;
 		new Setting(contentEl).setName('Confirm occurrence date').setHeading();
 		contentEl.createEl('p', {
-			text: 'This is an occurrence of a recurrent event. '
-				+ 'It is not possible to read the date of an occurrence of a recurrent event. '
-				+ 'Every occurrence produces an identical file with only the series start date. '
-				+ 'The field below is pre-filled with the occurrence nearest to today. '
-				+ 'Confirm if that is the event you dragged, or correct it to match '
-				+ 'the date shown in your calendar.'
+			text: 'Outlook did not provide a usable occurrence date. '
+				+ (this.dateStr
+					? 'The field below is pre-filled with the occurrence nearest to today. '
+					: 'An occurrence could not be calculated for this series. ')
+				+ 'Confirm or enter the date shown in your calendar.'
 		});
 
 		new Setting(contentEl)
